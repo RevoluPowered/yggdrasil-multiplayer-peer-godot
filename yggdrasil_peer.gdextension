@@ -1,0 +1,16 @@
+[configuration]
+entry_symbol = "yggdrasil_library_init"
+compatibility_minimum = "4.3"
+reloadable = true
+
+[libraries]
+macos.debug = "res://addons/yggdrasil/bin/yggdrasil_peer.debug.framework"
+macos.release = "res://addons/yggdrasil/bin/yggdrasil_peer.release.framework"
+linux.debug.x86_64 = "res://addons/yggdrasil/bin/yggdrasil_peer.debug.x86_64.so"
+linux.release.x86_64 = "res://addons/yggdrasil/bin/yggdrasil_peer.release.x86_64.so"
+windows.debug.x86_64 = "res://addons/yggdrasil/bin/yggdrasil_peer.debug.x86_64.dll"
+windows.release.x86_64 = "res://addons/yggdrasil/bin/yggdrasil_peer.release.x86_64.dll"
+ios.debug = "res://addons/yggdrasil/bin/yggdrasil_peer.debug.ios.framework"
+ios.release = "res://addons/yggdrasil/bin/yggdrasil_peer.release.ios.framework"
+android.debug.arm64 = "res://addons/yggdrasil/bin/yggdrasil_peer.debug.arm64.so"
+android.release.arm64 = "res://addons/yggdrasil/bin/yggdrasil_peer.release.arm64.so"
