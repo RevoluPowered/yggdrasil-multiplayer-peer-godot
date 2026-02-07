@@ -129,3 +129,55 @@ jobs:
             bin/*.so
             bin/*.dll
             bin/*.dylib
+
+  vest-test:
+    name: Vest Tests (${{ matrix.name }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            artifact: gdextension-linux-x86_64
+            godot_url: https://github.com/godotengine/godot/releases/download/4.6-stable/Godot_v4.6-stable_linux.x86_64.zip
+            godot_bin: Godot_v4.6-stable_linux.x86_64
+          - name: macOS
+            os: macos-latest
+            artifact: gdextension-macos-universal
+            godot_url: https://github.com/godotengine/godot/releases/download/4.6-stable/Godot_v4.6-stable_macos.universal.zip
+            godot_bin: Godot.app/Contents/MacOS/Godot
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: app/yggdrasil-test-app/addons/yggdrasil/bin/
+
+      - name: Download Godot 4.6
+        shell: bash
+        run: |
+          curl -L -o godot.zip "${{ matrix.godot_url }}"
+          unzip godot.zip -d godot_bin
+          chmod +x godot_bin/${{ matrix.godot_bin }}
+
+      - name: Import project (generate .godot/)
+        shell: bash
+        working-directory: app/yggdrasil-test-app
+        run: |
+          timeout 30 ../../godot_bin/${{ matrix.godot_bin }} --headless --import || true
+
+      - name: Run vest tests
+        shell: bash
+        working-directory: app/yggdrasil-test-app
+        run: |
+          ../../godot_bin/${{ matrix.godot_bin }} --headless \
+            -s addons/vest/cli/vest-cli.gd \
+            --vest-glob "res://test/**/*.test.gd" \
+            --vest-report-format tap \
+            --no-only
