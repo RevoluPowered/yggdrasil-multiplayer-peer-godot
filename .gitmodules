@@ -5,3 +5,9 @@
 	path = yggdrasil-go
 	url = https://github.com/RevoluPowered/yggdrasil-go.git
 	branch = gordon/add-library-support
+[submodule "vest"]
+	path = vest
+	url = https://github.com/foxssake/vest.git
+[submodule "netfox"]
+	path = netfox
+	url = https://github.com/foxssake/netfox.git

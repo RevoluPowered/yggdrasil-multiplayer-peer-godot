@@ -18,9 +18,9 @@ env = SConscript("godot-cpp/SConstruct")
 env.Append(CPPPATH=["src/", "yggdrasil-go/"])
 
 # --------------------------------------------------------------------------
-# Destination: auto-copy built artifacts to the netfox addon
+# Destination: auto-copy built artifacts to the test app addon
 # --------------------------------------------------------------------------
-ADDON_DIR = os.path.abspath("../netfox/addons/yggdrasil")
+ADDON_DIR = os.path.abspath("app/yggdrasil-test-app/addons/yggdrasil")
 ADDON_BIN = os.path.join(ADDON_DIR, "bin")
 
 # --------------------------------------------------------------------------
