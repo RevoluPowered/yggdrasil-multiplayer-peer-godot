@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://bxdf3q2keidsw"]
+
+[ext_resource type="Script" uid="uid://d05p7gtawmvby" path="res://test/yggdrasil/yggdrasil-connection.test.gd" id="1"]
+
+[node name="YggConnectionTest" type="Node" unique_id=1730994246]
+script = ExtResource("1")

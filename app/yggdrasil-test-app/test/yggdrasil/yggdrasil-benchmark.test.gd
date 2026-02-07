@@ -1,0 +1,685 @@
+extends VestTest
+## VEST benchmark suite for YggdrasilPeer.
+## Measures CGo call overhead, send/recv latency, throughput,
+## multi-peer broadcast, jitter, drift, and poll behaviour.
+
+const YGG_CONFIG := '{
+	"MulticastInterfaces": [
+		{"Regex": ".*", "Beacon": true, "Listen": true, "Port": 0, "Priority": 0}
+	]
+}'
+
+const YGG_CLIENT_CONFIG := '{
+	"MulticastInterfaces": [
+		{"Regex": ".*", "Beacon": false, "Listen": true, "Port": 0, "Priority": 0}
+	]
+}'
+
+# --- Tuning constants ---
+const NOOP_ITERATIONS := 100_000
+const NOOP_DATA_SIZES := [8, 64, 256, 1024, 4096, 16384, 65000]
+const NOOP_DATA_ITERS := 10_000
+
+const LATENCY_SIZES := [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65000]
+const LATENCY_REPS := 100
+
+const LARGE_SIZES := [131072, 1048576, 16777216, 134217728, 268435456, 1073741824]
+const CHUNK_SIZE := 60000
+const CHUNKS_PER_FRAME := 200
+const LARGE_TIMEOUT_SEC := 120.0
+
+const MP_CONFIGS := [
+	{"count": 10, "sizes": [8, 64, 512, 4096, 32768, 65000], "reps": 20, "label": "10p"},
+	{"count": 5, "sizes": [8, 64, 512, 4096], "reps": 10, "label": "5p"},
+]
+
+const THROUGHPUT_SIZES := [1500, 10000, 60000]
+const THROUGHPUT_REPS := 1000
+
+const JITTER_COUNT := 1000
+const JITTER_INTERVAL_US := 16667  # 60 Hz
+const DRIFT_COUNT := 1000
+const POLL_REPS := 100
+const MPOLL_SIZES := [8, 64, 256, 1024, 4096, 16384, 65000]
+const MPOLL_REPS := 100
+
+# --- Shared state ---
+var _tree: SceneTree
+var server_peer: YggdrasilPeer
+var client_peer: YggdrasilPeer
+var server_mp: SceneMultiplayer
+var client_mp: SceneMultiplayer
+var _results: Array = []
+var _mp_client_counter := 0
+var _server_listen_uri := ""  # TCP listener URI for direct peering (bypass multicast)
+
+func get_suite_name() -> String:
+	return "YggdrasilBenchmark"
+
+# ---------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------
+
+func before_case(_case_def):
+	if not _tree:
+		_tree = Vest.get_tree()
+
+func after_all():
+	# NOTE: after_all() is NOT called by VEST's run_glob (CLI mode).
+	# Cleanup is handled by the "teardown" test case in suite() instead.
+	_do_cleanup()
+
+# ---------------------------------------------------------------
+# Suite
+# ---------------------------------------------------------------
+
+func suite() -> void:
+	# --- Setup ---
+	define("setup", func():
+		test("connect server and client", func():
+			var sw = Node.new(); sw.name = "BenchSrv"
+			_tree.root.add_child(sw)
+			var cw = Node.new(); cw.name = "BenchCli"
+			_tree.root.add_child(cw)
+
+			server_peer = YggdrasilPeer.new()
+			expect_equal(server_peer.create_host(YGG_CONFIG), OK, "create_host")
+			# Start TCP listener for direct peering (bypasses multicast)
+			_server_listen_uri = server_peer.start_listener("tcp://127.0.0.1:0")
+			print("  Server TCP listener: %s" % _server_listen_uri)
+			server_mp = SceneMultiplayer.new()
+			server_mp.server_relay = true
+			server_mp.multiplayer_peer = server_peer
+			_tree.set_multiplayer(server_mp, ^"/root/BenchSrv")
+
+			client_peer = YggdrasilPeer.new()
+			var addr = server_peer.get_yggdrasil_address()
+			var cli_cfg = _client_config_with_peer()
+			expect_equal(client_peer.create_client(addr, cli_cfg), OK, "create_client")
+			client_mp = SceneMultiplayer.new()
+			client_mp.multiplayer_peer = client_peer
+			_tree.set_multiplayer(client_mp, ^"/root/BenchCli")
+
+			await _wait_connected(server_peer)
+		)
+	)
+
+	# --- CGo overhead ---
+	define("CGo overhead", func():
+		test("noop latency (%d iters)" % NOOP_ITERATIONS, func():
+			var timings := PackedFloat64Array()
+			timings.resize(NOOP_ITERATIONS)
+			for i in NOOP_ITERATIONS:
+				var t0 = Time.get_ticks_usec()
+				server_peer.benchmark_noop()
+				timings[i] = float(Time.get_ticks_usec() - t0)
+			_record("cgo_noop", timings)
+		)
+
+		test("noop with data", func():
+			for sz in NOOP_DATA_SIZES:
+				var timings := PackedFloat64Array()
+				timings.resize(NOOP_DATA_ITERS)
+				for i in NOOP_DATA_ITERS:
+					var t0 = Time.get_ticks_usec()
+					server_peer.benchmark_noop_data(sz)
+					timings[i] = float(Time.get_ticks_usec() - t0)
+				_record("cgo_noop_%s" % _fmt(sz), timings)
+		)
+	)
+
+	# --- Single-peer latency ---
+	define("single-peer latency", func():
+		test("send/recv across sizes", func():
+			for sz in LATENCY_SIZES:
+				var timings := PackedFloat64Array()
+				for rep in LATENCY_REPS:
+					var send_us = Time.get_ticks_usec()
+					client_mp.send_bytes(_payload(sz, 0xBB), 1, MultiplayerPeer.TRANSFER_MODE_RELIABLE)
+					await server_mp.peer_packet
+					timings.append(float(Time.get_ticks_usec() - send_us))
+				_record("send_recv_%s" % _fmt(sz), timings)
+			print(">>> send_recv test callback DONE")
+		)
+	)
+	print(">>> single-peer latency define DONE")
+
+	# --- Echo round-trip throughput (mirrors Go TestThroughput) ---
+	define("echo throughput", func():
+		test("round-trip throughput across sizes", func():
+			for sz in THROUGHPUT_SIZES:
+				var timings := PackedFloat64Array()
+				var total_bytes := 0
+				var start_us = Time.get_ticks_usec()
+				for rep in THROUGHPUT_REPS:
+					client_mp.send_bytes(_payload(sz, 0xCC), 1, MultiplayerPeer.TRANSFER_MODE_RELIABLE)
+					await server_mp.peer_packet
+					total_bytes += sz
+					timings.append(float(Time.get_ticks_usec() - start_us))
+				var elapsed_us = Time.get_ticks_usec() - start_us
+				var elapsed_sec = elapsed_us / 1_000_000.0
+				var mbps = (total_bytes / 1_000_000.0) / elapsed_sec if elapsed_sec > 0 else 0.0
+				_record("echo_throughput_%s" % _fmt(sz), timings,
+					{"mbps": mbps, "total_bytes": total_bytes, "reps": THROUGHPUT_REPS})
+		)
+	)
+
+	# --- Large chunked transfer ---
+	define("large transfer", func():
+		print(">>> ENTERED large transfer section")
+		test("throughput across sizes", func():
+			print(">>> ENTERED throughput test")
+			for target in LARGE_SIZES:
+				await _measure_throughput(target)
+		)
+	)
+
+	# --- Multi-peer broadcast ---
+	define("multi-peer broadcast", func():
+		test("10 peers", func():
+			await _run_broadcast(10, [8, 64, 512, 4096, 32768, 65000], 20, "10p")
+		)
+		test("5 peers", func():
+			await _run_broadcast(5, [8, 64, 512, 4096], 10, "5p")
+		)
+	)
+
+	# --- Multicast discovery ---
+	define("multicast discovery", func():
+		test("3 clients with multicast", func():
+			var t0 = Time.get_ticks_usec()
+			# These clients use TCP peering via _server_listen_uri (same as broadcast)
+			var clients := _create_mp_clients(3)
+			await _wait_mp_connections(clients)
+			var elapsed_us = Time.get_ticks_usec() - t0
+			var connected_count := 0
+			for c in clients:
+				if c["connected"]: connected_count += 1
+			_record("mcast_discovery_3p", PackedFloat64Array([float(elapsed_us)]),
+				{"connected": connected_count, "total": 3})
+			expect_equal(connected_count, 3, "All multicast clients should connect")
+			_cleanup_mp_clients(clients)
+		)
+	)
+
+	# --- Jitter & drift ---
+	define("jitter and drift", func():
+		test("60Hz jitter detection", func():
+			await _run_jitter()
+		)
+		test("accumulating delay", func():
+			await _run_drift()
+		)
+	)
+
+	# --- Poll comparison ---
+	define("poll comparison", func():
+		test("poll-to-delivery latency", func():
+			await _run_poll_delivery()
+		)
+		test("manual poll vs auto-poll", func():
+			await _run_manual_poll()
+		)
+	)
+
+	# --- Teardown (must be last) ---
+	# VEST's run_glob does NOT call after_all(), so cleanup must be a test case
+	define("teardown", func():
+		test("cleanup peers and multiplayer", func():
+			_do_cleanup()
+		)
+	)
+
+# ---------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------
+
+func _wait_connected(peer: YggdrasilPeer, timeout: float = 10.0):
+	# Mirrors Go WaitConnected: 50*100ms tree poll + 3s session wait = ~8s typical
+	var state = {"connected": false}
+	peer.peer_connected.connect(func(_id): state["connected"] = true, CONNECT_ONE_SHOT)
+	var start = Time.get_ticks_msec()
+	var deadline = start + int(timeout * 1000)
+	var last_log := -1
+	while not state["connected"]:
+		if Time.get_ticks_msec() > deadline:
+			fail("Connection timeout after %.0fs" % timeout)
+			return
+		var elapsed_sec = (Time.get_ticks_msec() - start) / 1000
+		if elapsed_sec != last_log and elapsed_sec > 0 and elapsed_sec % 3 == 0:
+			last_log = elapsed_sec
+			print("  Still waiting for connection... (%ds)" % elapsed_sec)
+		await _tree.process_frame
+
+func _client_config_with_peer(base_config: String = YGG_CLIENT_CONFIG) -> String:
+	# Embed _server_listen_uri in the config's "Peers" array so peering happens
+	# at startup inside core.New(), avoiding the blocking core.AddPeer() call.
+	if _server_listen_uri == "":
+		return base_config
+	var cfg = JSON.parse_string(base_config)
+	if cfg == null:
+		cfg = {}
+	cfg["Peers"] = [_server_listen_uri]
+	return JSON.stringify(cfg)
+
+func _payload(sz: int, seed_byte: int = 0xAA) -> PackedByteArray:
+	var d := PackedByteArray()
+	d.resize(sz)
+	for i in sz:
+		d[i] = ((seed_byte * (i + 1)) + i) % 256
+	return d
+
+func _fmt(n: int) -> String:
+	if n >= 1_000_000_000: return "%.1fGB" % (n / 1_000_000_000.0)
+	elif n >= 1_000_000: return "%.1fMB" % (n / 1_000_000.0)
+	elif n >= 1_000: return "%.1fKB" % (n / 1_000.0)
+	else: return "%dB" % n
+
+func _stats(timings: PackedFloat64Array) -> Dictionary:
+	var sorted := PackedFloat64Array(timings)
+	sorted.sort()
+	var n := sorted.size()
+	if n == 0:
+		return {"count": 0, "avg_us": 0.0, "min_us": 0.0, "max_us": 0.0,
+			"p50_us": 0.0, "p99_us": 0.0, "stddev_us": 0.0}
+	var sum := 0.0
+	for t in sorted: sum += t
+	var avg := sum / n
+	var var_sum := 0.0
+	for t in sorted: var_sum += (t - avg) * (t - avg)
+	return {
+		"count": n, "avg_us": avg,
+		"min_us": sorted[0], "max_us": sorted[n - 1],
+		"p50_us": sorted[n / 2],
+		"p99_us": sorted[mini(int(n * 0.99), n - 1)],
+		"stddev_us": sqrt(var_sum / n),
+	}
+
+func _record(label: String, timings: PackedFloat64Array, extra: Dictionary = {}):
+	var r = _stats(timings)
+	r["label"] = label
+	r.merge(extra)
+	_results.append(r)
+	if r["count"] > 1:
+		print("  %-30s  avg=%8.1f  min=%8.1f  max=%8.1f  p99=%8.1f us" % [
+			label, r["avg_us"], r["min_us"], r["max_us"], r["p99_us"]])
+	else:
+		print("  %-30s  %8.1f us" % [label, r["avg_us"]])
+
+# ---------------------------------------------------------------
+# Throughput
+# ---------------------------------------------------------------
+
+func _measure_throughput(target: int):
+	var state = {"bytes_recv": 0}
+	var recv_cb = func(_id, pkt): state["bytes_recv"] += pkt.size()
+	server_mp.peer_packet.connect(recv_cb)
+
+	var chunk_sz = mini(target, CHUNK_SIZE)
+	var chunk_template = _payload(chunk_sz, 0xBE)
+	var num_chunks = ceili(float(target) / chunk_sz)
+	var remainder = target % chunk_sz
+	var last_chunk = chunk_template.slice(0, remainder) if remainder > 0 else chunk_template
+
+	print(">>> throughput %s: sending %d chunks (%d bytes each)" % [_fmt(target), num_chunks, chunk_sz])
+
+	var start_us = Time.get_ticks_usec()
+	var sent := 0
+	var send_errors := 0
+	while sent < num_chunks:
+		var batch = mini(CHUNKS_PER_FRAME, num_chunks - sent)
+		for i in batch:
+			var is_last = (sent == num_chunks - 1)
+			var err = client_mp.send_bytes(last_chunk if is_last else chunk_template, 1, MultiplayerPeer.TRANSFER_MODE_RELIABLE)
+			if err != OK:
+				send_errors += 1
+			sent += 1
+		await _tree.process_frame
+
+	print(">>> throughput %s: all %d chunks sent (%d errors), waiting for recv..." % [_fmt(target), num_chunks, send_errors])
+	print(">>> throughput %s: server avail_pkts=%d, bytes_recv=%d/%d" % [
+		_fmt(target), server_peer.get_available_packet_count(), state["bytes_recv"], target])
+
+	var timeout_us = int(LARGE_TIMEOUT_SEC * 1_000_000)
+	var last_log_sec := -1
+	while state["bytes_recv"] < target:
+		var elapsed_sec_now = (Time.get_ticks_usec() - start_us) / 1_000_000.0
+		if int(elapsed_sec_now) != last_log_sec and int(elapsed_sec_now) % 5 == 0:
+			last_log_sec = int(elapsed_sec_now)
+			print(">>> throughput %s: bytes_recv=%d/%d (%.1fs)" % [
+				_fmt(target), state["bytes_recv"], target, elapsed_sec_now])
+		if Time.get_ticks_usec() - start_us > timeout_us:
+			break
+		await _tree.process_frame
+
+	var elapsed_us = Time.get_ticks_usec() - start_us
+	var elapsed_sec = elapsed_us / 1_000_000.0
+	var mbps = (target / 1_000_000.0) / elapsed_sec if elapsed_sec > 0 else 0.0
+	server_mp.peer_packet.disconnect(recv_cb)
+
+	var timed_out = state["bytes_recv"] < target
+	_record("throughput_%s" % _fmt(target),
+		PackedFloat64Array([float(elapsed_us)]),
+		{"mbps": mbps, "total_bytes": target, "timeout": timed_out})
+	if timed_out:
+		print("    TIMEOUT: got %s/%s" % [_fmt(state["bytes_recv"]), _fmt(target)])
+
+# ---------------------------------------------------------------
+# Multi-peer broadcast
+# ---------------------------------------------------------------
+
+func _run_broadcast(count: int, sizes: Array, reps: int, label: String):
+	var clients := _create_mp_clients(count)
+	if clients.is_empty():
+		fail("No clients created")
+		return
+
+	await _wait_mp_connections(clients)
+
+	# Filter to only connected clients
+	var connected_clients = clients.filter(func(c): return c["connected"])
+	if connected_clients.is_empty():
+		fail("No clients connected")
+		_cleanup_mp_clients(clients)
+		return
+	if connected_clients.size() < clients.size():
+		print("  WARNING: only %d/%d connected, continuing with those" % [connected_clients.size(), clients.size()])
+
+	for sz in sizes:
+		var timings := PackedFloat64Array()
+		for rep in reps:
+			for c in connected_clients: c["recv_time"] = 0
+			var send_us = Time.get_ticks_usec()
+			server_mp.send_bytes(_payload(sz, 0xCC), 0, MultiplayerPeer.TRANSFER_MODE_RELIABLE)
+
+			var deadline = Time.get_ticks_usec() + 30_000_000
+			while true:
+				await _tree.process_frame
+				var all := true
+				var max_t := 0
+				for c in connected_clients:
+					if c["recv_time"] == 0: all = false; break
+					if c["recv_time"] > max_t: max_t = c["recv_time"]
+				if all:
+					timings.append(float(max_t - send_us))
+					break
+				if Time.get_ticks_usec() > deadline:
+					var got = connected_clients.filter(func(c): return c["recv_time"] > 0).size()
+					print("    TIMEOUT rep %d: %d/%d received" % [rep, got, connected_clients.size()])
+					break
+		_record("broadcast_%s_%s" % [label, _fmt(sz)], timings)
+
+	_cleanup_mp_clients(clients)
+
+func _create_mp_clients(count: int, config: String = YGG_CLIENT_CONFIG) -> Array:
+	var clients := []
+	var addr = server_peer.get_yggdrasil_address()
+	var cli_cfg = _client_config_with_peer(config)
+	for i in count:
+		var idx = _mp_client_counter
+		_mp_client_counter += 1
+		var peer = YggdrasilPeer.new()
+		if peer.create_client(addr, cli_cfg) != OK:
+			print("    Client %d create failed" % i)
+			continue
+		var mp = SceneMultiplayer.new()
+		mp.multiplayer_peer = peer
+		var node = Node.new()
+		node.name = "MPCli%d" % idx
+		_tree.root.add_child(node)
+		_tree.set_multiplayer(mp, NodePath("/root/MPCli%d" % idx))
+
+		var cd = {"peer": peer, "mp": mp, "node": node, "connected": false, "recv_time": 0}
+		peer.peer_connected.connect(func(_id, d=cd): d["connected"] = true)
+		mp.peer_packet.connect(func(_id, pkt, d=cd):
+			if d["recv_time"] == 0: d["recv_time"] = Time.get_ticks_usec()
+		)
+		clients.append(cd)
+	print("  Created %d/%d clients" % [clients.size(), count])
+	return clients
+
+func _wait_mp_connections(clients: Array, timeout: float = 20.0):
+	# Mirrors Go createServerWithClients: 150*100ms tree poll + 3s session wait
+	var start = Time.get_ticks_msec()
+	var deadline = start + int(timeout * 1000)
+	var last_log := -1
+	while true:
+		var n := 0
+		for c in clients:
+			if c["connected"]: n += 1
+		if n == clients.size():
+			var elapsed = (Time.get_ticks_msec() - start) / 1000.0
+			print("  All %d connected in %.1fs" % [n, elapsed])
+			return
+		var elapsed_sec = (Time.get_ticks_msec() - start) / 1000
+		if elapsed_sec != last_log and elapsed_sec > 0 and elapsed_sec % 5 == 0:
+			last_log = elapsed_sec
+			print("  Waiting for connections: %d/%d (%ds)" % [n, clients.size(), elapsed_sec])
+		if Time.get_ticks_msec() > deadline:
+			print("  TIMEOUT: %d/%d connected after %.0fs" % [n, clients.size(), timeout])
+			return
+		await _tree.process_frame
+
+func _cleanup_mp_clients(clients: Array):
+	for c in clients:
+		c["mp"].multiplayer_peer = null
+		c["peer"].close()
+		c["node"].queue_free()
+	# Wait for deferred frees + yggdrasil multicast stabilization
+	print("  Cleaning up %d clients, waiting for stabilization..." % clients.size())
+	await _tree.create_timer(3.0).timeout
+
+# ---------------------------------------------------------------
+# Jitter
+# ---------------------------------------------------------------
+
+func _run_jitter():
+	var arrivals := PackedFloat64Array()
+	var cb = func(_id, _pkt): arrivals.append(float(Time.get_ticks_usec()))
+	server_mp.peer_packet.connect(cb)
+
+	for i in JITTER_COUNT:
+		client_mp.send_bytes(_payload(64, 0xDD), 1, MultiplayerPeer.TRANSFER_MODE_UNRELIABLE)
+		await _tree.create_timer(JITTER_INTERVAL_US / 1_000_000.0).timeout
+
+	await _tree.create_timer(5.0).timeout
+	server_mp.peer_packet.disconnect(cb)
+
+	if arrivals.size() < 2:
+		skip("Not enough arrivals for jitter analysis")
+		return
+
+	var intervals := PackedFloat64Array()
+	for i in range(1, arrivals.size()):
+		intervals.append(arrivals[i] - arrivals[i - 1])
+
+	var r = _stats(intervals)
+	var spikes := 0
+	var max_spike := 0.0
+	for ival in intervals:
+		if ival > r["avg_us"] * 2.0:
+			spikes += 1
+			if ival > max_spike: max_spike = ival
+	_record("jitter_60hz", intervals, {"spike_count": spikes, "max_spike_us": max_spike})
+
+# ---------------------------------------------------------------
+# Drift
+# ---------------------------------------------------------------
+
+func _run_drift():
+	var send_times := PackedFloat64Array()
+	var recv_times := PackedFloat64Array()
+	var cb = func(_id, _pkt): recv_times.append(float(Time.get_ticks_usec()))
+	server_mp.peer_packet.connect(cb)
+
+	for i in DRIFT_COUNT:
+		send_times.append(float(Time.get_ticks_usec()))
+		client_mp.send_bytes(_payload(64, 0xEE), 1, MultiplayerPeer.TRANSFER_MODE_RELIABLE)
+		await _tree.create_timer(JITTER_INTERVAL_US / 1_000_000.0).timeout
+
+	await _tree.create_timer(5.0).timeout
+	server_mp.peer_packet.disconnect(cb)
+
+	var count = mini(send_times.size(), recv_times.size())
+	if count < 2:
+		skip("Not enough data for drift analysis")
+		return
+
+	var drifts := PackedFloat64Array()
+	var t0s: float = send_times[0]
+	var t0r: float = recv_times[0]
+	for i in count:
+		drifts.append((recv_times[i] - t0r) - (send_times[i] - t0s))
+
+	var ticks_drifted := 0
+	for d in drifts:
+		if abs(d) > 16667.0: ticks_drifted += 1
+
+	_record("accum_delay", drifts, {
+		"max_drift_us": drifts[count - 1],
+		"packets_over_1tick_drift": ticks_drifted,
+	})
+
+# ---------------------------------------------------------------
+# Poll-to-delivery
+# ---------------------------------------------------------------
+
+func _run_poll_delivery():
+	print(">>> poll_delivery START")
+	var poll_peer = YggdrasilPeer.new()
+	var addr = server_peer.get_yggdrasil_address()
+	var cli_cfg = _client_config_with_peer()
+	if poll_peer.create_client(addr, cli_cfg) != OK:
+		fail("Failed to create poll client")
+		return
+	var poll_mp = SceneMultiplayer.new()
+	poll_mp.root_path = ^"/root"
+	poll_mp.multiplayer_peer = poll_peer
+	# NOT registered with tree — we poll manually
+
+	var state = {"recv_time": 0}
+	poll_mp.peer_packet.connect(func(_id, _pkt): state["recv_time"] = Time.get_ticks_usec())
+
+	# Wait for connection (poll manually since not in tree)
+	# Use Dictionary for closure capture (GDScript value-type closure bug)
+	var conn = {"done": false}
+	poll_peer.peer_connected.connect(func(_id): conn["done"] = true, CONNECT_ONE_SHOT)
+	var deadline = Time.get_ticks_msec() + 15_000
+	while not conn["done"]:
+		poll_mp.poll()
+		if Time.get_ticks_msec() > deadline:
+			fail("Poll client connection timeout (15s)")
+			poll_mp.multiplayer_peer = null
+			poll_peer.close()
+			return
+		await _tree.process_frame
+
+	var timings := PackedFloat64Array()
+	var uid = poll_peer.get_unique_id()
+	for rep in POLL_REPS:
+		state["recv_time"] = 0
+		var send_us = Time.get_ticks_usec()
+		server_mp.send_bytes(_payload(64, 0xFF), uid, MultiplayerPeer.TRANSFER_MODE_RELIABLE)
+		var rep_deadline = Time.get_ticks_usec() + 30_000_000
+		while state["recv_time"] == 0:
+			poll_mp.poll()
+			if Time.get_ticks_usec() > rep_deadline: break
+			await _tree.process_frame
+		if state["recv_time"] > 0:
+			timings.append(float(state["recv_time"] - send_us))
+
+	poll_mp.multiplayer_peer = null
+	poll_peer.close()
+	print(">>> poll_delivery DONE, %d timings" % timings.size())
+	_record("poll_delivery", timings)
+
+# ---------------------------------------------------------------
+# Manual poll comparison
+# ---------------------------------------------------------------
+
+func _run_manual_poll():
+	print(">>> manual_poll START")
+	var state = {"recv_us": 0}
+	var cb = func(_id, _pkt): state["recv_us"] = Time.get_ticks_usec()
+	server_mp.peer_packet.connect(cb)
+
+	for sz in MPOLL_SIZES:
+		var timings := PackedFloat64Array()
+		for rep in MPOLL_REPS:
+			state["recv_us"] = 0
+			var send_us = Time.get_ticks_usec()
+			client_mp.send_bytes(_payload(sz, 0xAB), 1, MultiplayerPeer.TRANSFER_MODE_RELIABLE)
+			server_mp.poll()  # Immediate poll — bypasses frame-alignment delay
+
+			if state["recv_us"] == 0:
+				var rep_deadline = Time.get_ticks_usec() + 30_000_000
+				while state["recv_us"] == 0:
+					server_mp.poll()
+					if Time.get_ticks_usec() > rep_deadline: break
+					await _tree.process_frame
+
+			if state["recv_us"] > 0:
+				timings.append(float(state["recv_us"] - send_us))
+
+		_record("manual_poll_%s" % _fmt(sz), timings)
+
+	server_mp.peer_packet.disconnect(cb)
+	print(">>> manual_poll DONE")
+
+# ---------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------
+
+func _do_cleanup():
+	# Disconnect SceneMultiplayer before closing peers to prevent
+	# use-after-close when the tree auto-polls during other tests
+	if client_mp:
+		client_mp.multiplayer_peer = null
+	if server_mp:
+		server_mp.multiplayer_peer = null
+	if client_peer:
+		client_peer.close()
+		client_peer = null
+	if server_peer:
+		server_peer.close()
+		server_peer = null
+	# Free the tree nodes
+	if _tree:
+		var srv = _tree.root.get_node_or_null("BenchSrv")
+		if srv: srv.queue_free()
+		var cli = _tree.root.get_node_or_null("BenchCli")
+		if cli: cli.queue_free()
+	_print_results()
+
+# ---------------------------------------------------------------
+# Results table
+# ---------------------------------------------------------------
+
+func _print_results():
+	print("")
+	print("=".repeat(105))
+	print("=== BENCHMARK RESULTS (all times in microseconds) ===")
+	print("=".repeat(105))
+	print("  %-30s  %8s  %8s  %8s  %8s  %8s  %8s  %s" % [
+		"Test", "Count", "Avg", "Min", "Max", "P50", "P99", "Extra"])
+	print("  %s" % "-".repeat(100))
+
+	for r in _results:
+		var extra := PackedStringArray()
+		if r.has("mbps"): extra.append("%.2f MB/s" % r["mbps"])
+		if r.has("timeout") and r["timeout"]: extra.append("TIMEOUT")
+		if r.has("spike_count"): extra.append("spikes=%d" % r["spike_count"])
+		if r.has("max_spike_us"): extra.append("max_spike=%.0f" % r["max_spike_us"])
+		if r.has("max_drift_us"): extra.append("max_drift=%.0f" % r["max_drift_us"])
+		if r.has("packets_over_1tick_drift"): extra.append("over_1tick=%d" % r["packets_over_1tick_drift"])
+
+		if r["count"] <= 1:
+			print("  %-30s  %8d  %8.1f  %8s  %8s  %8s  %8s  %s" % [
+				r["label"], r["count"], r["avg_us"], "-", "-", "-", "-", " ".join(extra)])
+		else:
+			print("  %-30s  %8d  %8.1f  %8.1f  %8.1f  %8.1f  %8.1f  %s" % [
+				r["label"], r["count"],
+				r["avg_us"], r["min_us"], r["max_us"],
+				r["p50_us"], r["p99_us"], " ".join(extra)])
+
+	print("=".repeat(105))
