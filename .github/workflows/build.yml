@@ -104,10 +104,12 @@ jobs:
         with:
           ndk-version: r26d
 
-      - name: Set ANDROID_NDK_HOME
+      - name: Set ANDROID_NDK_ROOT
         if: matrix.platform == 'android'
         shell: bash
-        run: echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+        run: |
+          echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # -- Build --
       - name: Build GDExtension
