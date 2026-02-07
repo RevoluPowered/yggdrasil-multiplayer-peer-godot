@@ -63,16 +63,14 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-
       - uses: actions/setup-go@v5
         with:
           go-version-file: yggdrasil-go/go.mod
 
-      - name: Install SCons
-        run: pip install scons
+      - name: Setup godot-cpp
+        uses: ./godot-cpp/.github/actions/setup-godot-cpp
+        with:
+          platform: ${{ matrix.platform }}
 
       # -- godot-cpp cache keyed on submodule commit --
       - name: Get godot-cpp commit hash
@@ -91,35 +89,10 @@ jobs:
           restore-keys: |
             godot-cpp-${{ matrix.platform }}-${{ matrix.arch }}-
 
-      # -- Platform-specific setup --
-      - name: Add MinGW to PATH (Windows)
-        if: matrix.platform == 'windows'
-        shell: bash
-        run: echo "C:\\msys64\\mingw64\\bin" >> "$GITHUB_PATH"
-
-      - name: Setup Android NDK
-        if: matrix.platform == 'android'
-        uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r26d
-
-      - name: Set ANDROID_NDK_ROOT
-        if: matrix.platform == 'android'
-        shell: bash
-        run: |
-          echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
-
       # -- Build --
       - name: Build GDExtension
         shell: bash
-        run: |
-          EXTRA_ARGS=""
-          if [ "${{ matrix.platform }}" = "windows" ]; then
-            EXTRA_ARGS="use_mingw=yes"
-          fi
-          scons platform=${{ matrix.platform }} arch=${{ matrix.arch }} target=template_debug $EXTRA_ARGS
+        run: scons platform=${{ matrix.platform }} arch=${{ matrix.arch }} target=template_debug
 
       # -- Upload --
       - name: Upload artifact
