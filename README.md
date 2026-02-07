@@ -4,9 +4,14 @@ A GDExtension that provides a `MultiplayerPeerExtension` backed by [Yggdrasil](h
 
 Why?
 - Zero hosting costs for games
-- Session discovery can be done by the PROTOCOL.
+- Session discovery can be done by the PROTOCOL. (multicast session discovery)
 - Future: VOIP traffic can be done over tunnel
-
+- Bypasses CGNAT horribleness, needing to forward port
+- Uses IPV6 addressing internally
+- Encrypted by default
+- Supports QUIC protocol transport and TCP, this means you can essentially make QUIC "droppless" for game networking swapping from WiFi to 4G for example on outages.
+- You can use micro-networks per-session so the number of players is the peer count on the network
+- You can use a relay for all your players.
 
 ## Benchmark data:
 ```
