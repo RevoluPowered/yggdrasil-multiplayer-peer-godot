@@ -9,7 +9,7 @@ Why?
 
 
 ## Benchmark data:
-
+```
 Throughput Summary (60KB packets):
   Total          MB/s
   -----          ----
@@ -30,7 +30,7 @@ Latency Summary (echo RTT, 100 pings):
   8             586.865µs     36.679µs
   16            988.346µs     30.885µs
   64           3.562252ms      27.83µs
-
+```
 ## Supported Platforms
 
 | Platform | Architecture |
