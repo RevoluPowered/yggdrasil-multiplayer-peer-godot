@@ -28,18 +28,80 @@ ADDON_BIN = os.path.join(ADDON_DIR, "bin")
 # --------------------------------------------------------------------------
 YGG_GO_DIR = Dir("yggdrasil-go").abspath
 
+GO_ARCH_MAP = {"x86_64": "amd64", "x86_32": "386", "arm64": "arm64",
+               "arm32": "arm", "universal": ""}
+
+def _go_build_direct(build_env, goarch):
+    """Build libyggdrasil.a by invoking go build directly."""
+    if goarch:
+        build_env["GOARCH"] = goarch
+    return subprocess.run(
+        ["go", "build", "-v", "-buildmode=c-archive",
+         "-o", "libyggdrasil.a", "-ldflags=-s -w", "./contrib/lib"],
+        cwd=YGG_GO_DIR, env=build_env,
+    )
+
 def build_yggdrasil_lib(target, source, env):
     """Build the Go static library from the yggdrasil-go submodule."""
-    print("[ygg] Building libyggdrasil.a from yggdrasil-go submodule...")
-    result = subprocess.run(
-        ["sh", "./contrib/lib/build", "-s"],
-        cwd=YGG_GO_DIR,
-    )
+    plat = env["platform"]
+    arch = env.get("arch", "")
+    print("[ygg] Building libyggdrasil.a ({} {})...".format(plat, arch))
+
+    build_env = os.environ.copy()
+    build_env["CGO_ENABLED"] = "1"
+    goarch = GO_ARCH_MAP.get(arch, arch)
+
+    if plat == "macos" and arch == "universal":
+        # Build script handles universal (arm64+x86_64) via lipo
+        result = subprocess.run(
+            ["sh", "./contrib/lib/build", "-s"],
+            cwd=YGG_GO_DIR, env=build_env,
+        )
+    elif plat == "android":
+        build_env["GOOS"] = "android"
+        ndk = os.environ.get("ANDROID_NDK_HOME", os.environ.get("ANDROID_NDK_ROOT", ""))
+        if ndk:
+            import platform as pf
+            host = "darwin-x86_64" if pf.system() == "Darwin" else "linux-x86_64"
+            build_env["CC"] = os.path.join(ndk,
+                "toolchains", "llvm", "prebuilt", host, "bin",
+                "aarch64-linux-android21-clang")
+        result = _go_build_direct(build_env, goarch or "arm64")
+    elif plat == "ios":
+        build_env["GOOS"] = "ios"
+        try:
+            sdk = subprocess.check_output(
+                ["xcrun", "--sdk", "iphoneos", "--show-sdk-path"],
+            ).decode().strip()
+            cc = subprocess.check_output(
+                ["xcrun", "--sdk", "iphoneos", "-f", "clang"],
+            ).decode().strip()
+            build_env["CC"] = cc
+            build_env["CGO_CFLAGS"] = "-isysroot " + sdk
+            build_env["CGO_LDFLAGS"] = "-isysroot " + sdk
+        except Exception:
+            pass
+        result = _go_build_direct(build_env, goarch or "arm64")
+    elif plat == "windows":
+        build_env["GOOS"] = "windows"
+        result = _go_build_direct(build_env, goarch or "amd64")
+    elif plat == "linux":
+        # Build script works natively on Linux
+        result = subprocess.run(
+            ["sh", "./contrib/lib/build", "-s"],
+            cwd=YGG_GO_DIR, env=build_env,
+        )
+    else:
+        # Single-arch macOS or other: go build directly
+        if plat == "macos":
+            build_env["GOOS"] = "darwin"
+        result = _go_build_direct(build_env, goarch)
+
     if result.returncode != 0:
         print("[ygg] Build FAILED")
         return 1
-    # The universal macOS build produces per-arch headers (libyggdrasil_arm64.h etc.)
-    # but no generic libyggdrasil.h. They're identical, so copy one.
+
+    # macOS universal build creates per-arch headers but no generic one; copy one
     generic_h = os.path.join(YGG_GO_DIR, "libyggdrasil.h")
     if not os.path.exists(generic_h):
         import glob as g
