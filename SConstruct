@@ -15,7 +15,7 @@ import shutil
 
 env = SConscript("godot-cpp/SConstruct")
 
-env.Append(CPPPATH=["src/"])
+env.Append(CPPPATH=["src/", "yggdrasil-go/"])
 
 # --------------------------------------------------------------------------
 # Destination: auto-copy built artifacts to the netfox addon
@@ -24,9 +24,38 @@ ADDON_DIR = os.path.abspath("../netfox/addons/yggdrasil")
 ADDON_BIN = os.path.join(ADDON_DIR, "bin")
 
 # --------------------------------------------------------------------------
-# Static library: libyggdrasil.a
+# Static library: build libyggdrasil.a from the yggdrasil-go submodule
 # --------------------------------------------------------------------------
-ygg_lib = File("bin/libyggdrasil.a")
+YGG_GO_DIR = Dir("yggdrasil-go").abspath
+
+def build_yggdrasil_lib(target, source, env):
+    """Build the Go static library from the yggdrasil-go submodule."""
+    print("[ygg] Building libyggdrasil.a from yggdrasil-go submodule...")
+    result = subprocess.run(
+        ["sh", "./contrib/lib/build", "-s"],
+        cwd=YGG_GO_DIR,
+    )
+    if result.returncode != 0:
+        print("[ygg] Build FAILED")
+        return 1
+    # The universal macOS build produces per-arch headers (libyggdrasil_arm64.h etc.)
+    # but no generic libyggdrasil.h. They're identical, so copy one.
+    generic_h = os.path.join(YGG_GO_DIR, "libyggdrasil.h")
+    if not os.path.exists(generic_h):
+        import glob as g
+        arch_headers = g.glob(os.path.join(YGG_GO_DIR, "libyggdrasil_*.h"))
+        if arch_headers:
+            shutil.copy2(arch_headers[0], generic_h)
+            print("[ygg] Copied {} -> libyggdrasil.h".format(
+                os.path.basename(arch_headers[0])))
+    return 0
+
+ygg_lib_build = env.Command(
+    ["yggdrasil-go/libyggdrasil.a", "yggdrasil-go/libyggdrasil.h"],
+    Glob("yggdrasil-go/contrib/lib/*.go"),
+    build_yggdrasil_lib,
+)
+ygg_lib = ygg_lib_build[0]
 
 # Force static linking by passing the .a file directly (not -lyggdrasil)
 # so the Go runtime is baked into the final shared library — no DLL-in-DLL.
