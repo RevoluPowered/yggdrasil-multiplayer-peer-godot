@@ -58,7 +58,7 @@ def build_yggdrasil_lib(target, source, env):
             cwd=YGG_GO_DIR, env=build_env,
         )
     elif plat == "android":
-        build_env["GOOS"] = "android"
+        build_env["GOOS"] = "linux"  # c-archive not supported on GOOS=android; linux .a works with NDK
         ndk = os.environ.get("ANDROID_NDK_HOME", os.environ.get("ANDROID_NDK_ROOT", ""))
         if ndk:
             import platform as pf
