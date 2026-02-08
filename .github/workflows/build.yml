@@ -3,6 +3,8 @@ name: Build
 on:
   push:
   pull_request:
+  release:
+    types: [published]
 
 jobs:
   test:
@@ -30,7 +32,7 @@ jobs:
         run: go test -v -timeout 10m -run "^Test(CoreWriteToReadFrom|TenClientsToOneServer)$" ./contrib/lib/
 
   build:
-    name: Build (${{ matrix.name }})
+    name: Build (${{ matrix.name }} ${{ matrix.target }})
     needs: test
     strategy:
       fail-fast: false
@@ -56,6 +58,7 @@ jobs:
             platform: ios
             arch: arm64
             os: macos-latest
+        target: [template_debug, template_release]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -87,9 +90,9 @@ jobs:
             godot-cpp/bin/
             godot-cpp/gen/
             .sconsign.dblite
-          key: godot-cpp-${{ matrix.platform }}-${{ matrix.arch }}-${{ steps.godot-cpp.outputs.hash }}
+          key: godot-cpp-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.target }}-${{ steps.godot-cpp.outputs.hash }}
           restore-keys: |
-            godot-cpp-${{ matrix.platform }}-${{ matrix.arch }}-
+            godot-cpp-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.target }}-
 
       # -- Platform-specific setup --
       - name: Install MinGW cross-compiler (Windows from Linux)
@@ -119,13 +122,13 @@ jobs:
           if [ "${{ matrix.platform }}" = "windows" ]; then
             EXTRA_ARGS="use_mingw=yes"
           fi
-          scons platform=${{ matrix.platform }} arch=${{ matrix.arch }} target=template_debug $EXTRA_ARGS
+          scons platform=${{ matrix.platform }} arch=${{ matrix.arch }} target=${{ matrix.target }} $EXTRA_ARGS
 
       # -- Upload --
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gdextension-${{ matrix.platform }}-${{ matrix.arch }}
+          name: gdextension-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.target }}
           path: |
             bin/*.framework/
             bin/*.so
@@ -141,12 +144,12 @@ jobs:
         include:
           - name: Linux
             os: ubuntu-latest
-            artifact: gdextension-linux-x86_64
+            artifact: gdextension-linux-x86_64-template_debug
             godot_url: https://github.com/godotengine/godot/releases/download/4.6-stable/Godot_v4.6-stable_linux.x86_64.zip
             godot_bin: Godot_v4.6-stable_linux.x86_64
           - name: macOS
             os: macos-latest
-            artifact: gdextension-macos-universal
+            artifact: gdextension-macos-universal-template_debug
             godot_url: https://github.com/godotengine/godot/releases/download/4.6-stable/Godot_v4.6-stable_macos.universal.zip
             godot_bin: Godot.app/Contents/MacOS/Godot
     runs-on: ${{ matrix.os }}
@@ -183,3 +186,48 @@ jobs:
             --vest-glob "res://test/**/*.test.gd" \
             --vest-report-format tap \
             --no-only
+
+  release:
+    name: Package Release
+    if: github.event_name == 'release'
+    needs: [build, vest-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gdextension-*
+          path: artifacts/
+
+      - name: Assemble addon
+        shell: bash
+        run: |
+          mkdir -p addon/addons/yggdrasil/bin
+
+          # Copy GDScript files and plugin config
+          cp app/yggdrasil-test-app/addons/yggdrasil/*.gd addon/addons/yggdrasil/
+          cp app/yggdrasil-test-app/addons/yggdrasil/plugin.cfg addon/addons/yggdrasil/
+          cp yggdrasil_peer.gdextension addon/addons/yggdrasil/yggdrasil.gdextension
+
+          # Copy all platform binaries into bin/
+          for dir in artifacts/gdextension-*/; do
+            cp -r "$dir"/* addon/addons/yggdrasil/bin/ 2>/dev/null || true
+          done
+
+          # List contents for verification
+          echo "=== Addon contents ==="
+          find addon/ -type f | sort
+
+          # Create zip
+          cd addon
+          zip -r ../yggdrasil-peer-addon.zip addons/
+
+      - name: Upload release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" yggdrasil-peer-addon.zip --clobber

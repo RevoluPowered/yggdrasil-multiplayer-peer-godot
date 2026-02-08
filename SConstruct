@@ -127,7 +127,11 @@ ygg_lib = ygg_lib_build[0]
 
 # Force static linking by passing the .a file directly (not -lyggdrasil)
 # so the Go runtime is baked into the final shared library — no DLL-in-DLL.
-env.Append(LINKFLAGS=[ygg_lib.abspath])
+# MinGW needs --whole-archive to pull all symbols from the Go static archive.
+if env["platform"] == "windows":
+    env.Append(LINKFLAGS=["-Wl,--whole-archive", ygg_lib.abspath, "-Wl,--no-whole-archive"])
+else:
+    env.Append(LINKFLAGS=[ygg_lib.abspath])
 
 # Go runtime dependencies required when statically linking a c-archive
 platform = env["platform"]
