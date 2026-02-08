@@ -3,7 +3,8 @@
 A GDExtension that provides a `MultiplayerPeerExtension` backed by [Yggdrasil](https://yggdrasil-network.github.io/), enabling peer-to-peer multiplayer over the Yggdrasil mesh network.
 
 Stability notes:
-- Connections need more work to resolve hop latency, and also to implement unreliable transfer via QUIC
+- Connections need more work to resolve hop latency, and also to implement unreliable transfer via QUIC.
+- Crashes don't seem common but the system hanging is common, this is due to a bug in the gdextension.
 
 End goals:
 - Zero hosting costs for games
