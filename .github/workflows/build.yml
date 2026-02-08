@@ -37,28 +37,29 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        platform: [linux, macos, windows, android, ios]
+        target: [template_debug, template_release]
         include:
-          - name: Linux x86_64
-            platform: linux
+          - platform: linux
+            name: Linux x86_64
             arch: x86_64
             os: ubuntu-latest
-          - name: macOS universal
-            platform: macos
+          - platform: macos
+            name: macOS universal
             arch: universal
             os: macos-latest
-          - name: Windows x86_64
-            platform: windows
+          - platform: windows
+            name: Windows x86_64
             arch: x86_64
             os: ubuntu-latest
-          - name: Android arm64
-            platform: android
+          - platform: android
+            name: Android arm64
             arch: arm64
             os: ubuntu-latest
-          - name: iOS arm64
-            platform: ios
+          - platform: ios
+            name: iOS arm64
             arch: arm64
             os: macos-latest
-        target: [template_debug, template_release]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
