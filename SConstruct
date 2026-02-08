@@ -85,6 +85,11 @@ def build_yggdrasil_lib(target, source, env):
         result = _go_build_direct(build_env, goarch or "arm64")
     elif plat == "windows":
         build_env["GOOS"] = "windows"
+        # Cross-compiling from Linux needs MinGW CC for CGo
+        import platform as pf
+        if pf.system() == "Linux":
+            arch_cc = {"amd64": "x86_64-w64-mingw32-gcc", "386": "i686-w64-mingw32-gcc"}
+            build_env["CC"] = arch_cc.get(goarch or "amd64", "x86_64-w64-mingw32-gcc")
         result = _go_build_direct(build_env, goarch or "amd64")
     elif plat == "linux":
         # Build script works natively on Linux
