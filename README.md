@@ -2,7 +2,7 @@
 
 A GDExtension that provides a `MultiplayerPeerExtension` backed by [Yggdrasil](https://yggdrasil-network.github.io/), enabling peer-to-peer multiplayer over the Yggdrasil mesh network.
 
-Why is this being worked on?
+What's the point of this?
 - Zero hosting costs for games
 - Session discovery can be done by the PROTOCOL. (multicast session discovery)
 - Future: VOIP traffic can be done over tunnel
