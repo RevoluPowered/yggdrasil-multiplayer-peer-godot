@@ -6,6 +6,8 @@ Stability notes:
 - Connections need more work to resolve hop latency, and also to implement unreliable transfer via QUIC.
 - Crashes don't seem common but the network hanging is common if you use mutilple nodes in a chain, when you use nodes direct to each other via their address it seems to be ok.
 - I've tested with netfox netbrawler demo and it works but eventually introduces overhead as the game progresses, I believe due to the missing support for QUIC Unreliable packets, but I cannot be sure of this until I have more unit tests.
+- This is not production ready, yggdrasil is not even finished yet.
+- Throughput on LAN is OK but not tested wider internet yet.
 
 End goals:
 - Zero hosting costs for games
