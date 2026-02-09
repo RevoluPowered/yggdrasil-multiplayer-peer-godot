@@ -38,12 +38,12 @@ Latency Summary (echo RTT, 100 pings):
 ```
 
 Stability notes:
-- Connections need more work to resolve hop latency with the godot side, and also to implement unreliable transfer via QUIC.
-- Crashes don't seem common but the network hanging is common if you use mutilple nodes in a chain, when you use nodes direct to each other via their address it seems to be ok.
+- ~~Connections need more work to resolve hop latency with the godot side, and also to implement unreliable transfer via QUIC.~~ (fixed: 9 Feb 2026)
+- ~~Crashes don't seem common but the network hanging is common if you use mutilple nodes in a chain, when you use nodes direct to each other via their address it seems to be ok.~~  (fixed: 9 Feb 2026)
 - I've tested with netfox netbrawler demo and it works but eventually introduces overhead as the game progresses, I believe due to the missing support for QUIC Unreliable packets, but I cannot be sure of this until I have more unit tests.
 - This is not production ready, yggdrasil is not even finished yet.
-- Throughput on LAN is OK but not tested wider internet yet.
-- RFC 9221 
+- Throughput on LAN is OK but not tested wider internet yet. 
+- ~~RFC 9221 - UDP Unreliable Transfer Implemented~~  (added: 9 Feb 2026)
 
 ## Supported Platforms
 
