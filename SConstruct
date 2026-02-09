@@ -169,6 +169,10 @@ library = env.SharedLibrary(
     "bin/{}".format(lib_name),
     source=sources,
 )
+# SCons uses content hashes, not timestamps. The .a is passed via LINKFLAGS
+# so SCons doesn't automatically know the dylib depends on it. Without this,
+# rebuilding libyggdrasil.a won't trigger relinking.
+env.Depends(library, ygg_lib)
 
 Default(library)
 

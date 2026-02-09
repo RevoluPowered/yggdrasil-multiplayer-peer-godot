@@ -1,14 +1,10 @@
 #include "yggdrasil_peer.h"
 
 #include <godot_cpp/core/class_db.hpp>
+#include <godot_cpp/classes/os.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
-#ifdef _WIN32
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#endif
 #include <cstring>
 
 #include "libyggdrasil.h"
@@ -16,43 +12,19 @@
 namespace godot {
 
 // ---------------------------------------------------------------------------
-// IPv6 + UDP packet helpers
+// Big-endian helpers (used in protocol messages for peer ID encoding)
 // ---------------------------------------------------------------------------
 
-static void write_u16_be(uint8_t *dst, uint16_t val) {
-	dst[0] = (val >> 8) & 0xFF;
-	dst[1] = val & 0xFF;
-}
-
-static uint16_t read_u16_be(const uint8_t *src) {
-	return ((uint16_t)src[0] << 8) | src[1];
-}
-
-static void write_u32_be(uint8_t *dst, uint32_t val) {
+void YggdrasilPeer::write_u32_be(uint8_t *dst, uint32_t val) {
 	dst[0] = (val >> 24) & 0xFF;
 	dst[1] = (val >> 16) & 0xFF;
 	dst[2] = (val >> 8) & 0xFF;
 	dst[3] = val & 0xFF;
 }
 
-static uint32_t read_u32_be(const uint8_t *src) {
+uint32_t YggdrasilPeer::read_u32_be(const uint8_t *src) {
 	return ((uint32_t)src[0] << 24) | ((uint32_t)src[1] << 16) |
 			((uint32_t)src[2] << 8) | src[3];
-}
-
-bool YggdrasilPeer::parse_ipv6_addr(const std::string &str, uint8_t out[16]) {
-	struct in6_addr addr;
-	if (inet_pton(AF_INET6, str.c_str(), &addr) == 1) {
-		memcpy(out, &addr, 16);
-		return true;
-	}
-	return false;
-}
-
-std::string YggdrasilPeer::format_ipv6_addr(const uint8_t addr[16]) {
-	char buf[INET6_ADDRSTRLEN];
-	inet_ntop(AF_INET6, addr, buf, sizeof(buf));
-	return std::string(buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -71,11 +43,13 @@ String YggdrasilPeer::_log_prefix() const {
 }
 
 void YggdrasilPeer::_log(const String &msg) const {
-	UtilityFunctions::print(_log_prefix() + msg);
+	if (OS::get_singleton()->is_stdout_verbose()) {
+		UtilityFunctions::print(_log_prefix() + msg);
+	}
 }
 
 void YggdrasilPeer::_log_dbg(const String &msg) const {
-	if (debug_logging) {
+	if (debug_logging && OS::get_singleton()->is_stdout_verbose()) {
 		UtilityFunctions::print(_log_prefix() + msg);
 	}
 }
@@ -89,14 +63,24 @@ void YggdrasilPeer::_log_err(const String &msg) const {
 // ---------------------------------------------------------------------------
 
 static void ygg_log_bridge(const char *msg, int level) {
+	String godot_msg = String(msg);
+	if (godot_msg.ends_with("\n")) {
+		godot_msg = godot_msg.substr(0, godot_msg.length() - 1);
+	}
+
+	// Show [IW-SESSION] trace logs only when --verbose is passed to Godot
+	if (godot_msg.begins_with("[IW-SESSION]")) {
+		if (OS::get_singleton()->is_stdout_verbose()) {
+			UtilityFunctions::print(godot_msg);
+		}
+		return;
+	}
+
 	// Only show warnings and errors from yggdrasil internals
 	if (level < 3) {
 		return;
 	}
-	String godot_msg = String("[Yggdrasil] ") + String(msg);
-	if (godot_msg.ends_with("\n")) {
-		godot_msg = godot_msg.substr(0, godot_msg.length() - 1);
-	}
+	godot_msg = String("[Yggdrasil] ") + godot_msg;
 	if (level >= 4) {
 		UtilityFunctions::printerr(godot_msg);
 	} else {
@@ -121,8 +105,10 @@ YggdrasilPeer::~YggdrasilPeer() {
 
 void YggdrasilPeer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("create_host", "config_json"), &YggdrasilPeer::create_host, DEFVAL("{}"));
-	ClassDB::bind_method(D_METHOD("create_client", "server_address", "config_json"), &YggdrasilPeer::create_client, DEFVAL("{}"));
+	ClassDB::bind_method(D_METHOD("create_client", "server_identity", "config_json"), &YggdrasilPeer::create_client, DEFVAL("{}"));
+	ClassDB::bind_method(D_METHOD("create_relay", "config_json"), &YggdrasilPeer::create_relay, DEFVAL("{}"));
 	ClassDB::bind_method(D_METHOD("get_yggdrasil_address"), &YggdrasilPeer::get_yggdrasil_address);
+	ClassDB::bind_method(D_METHOD("get_yggdrasil_public_key"), &YggdrasilPeer::get_yggdrasil_public_key);
 	ClassDB::bind_method(D_METHOD("start_listener", "uri"), &YggdrasilPeer::start_listener);
 	ClassDB::bind_method(D_METHOD("add_yggdrasil_peer", "uri"), &YggdrasilPeer::add_yggdrasil_peer);
 	ClassDB::bind_method(D_METHOD("remove_yggdrasil_peer", "uri"), &YggdrasilPeer::remove_yggdrasil_peer);
@@ -135,9 +121,26 @@ void YggdrasilPeer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_debug_logging"), &YggdrasilPeer::get_debug_logging);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "debug_logging"), "set_debug_logging", "get_debug_logging");
 
+	// Routing state
+	ClassDB::bind_method(D_METHOD("has_route", "peer_key_hex"), &YggdrasilPeer::has_route);
+	ClassDB::bind_method(D_METHOD("get_routing_entries"), &YggdrasilPeer::get_routing_entries);
+	ClassDB::bind_method(D_METHOD("get_tree_entries"), &YggdrasilPeer::get_tree_entries);
+
+	// Signals
+	ADD_SIGNAL(MethodInfo("packet_dropped",
+			PropertyInfo(Variant::STRING, "peer_key"),
+			PropertyInfo(Variant::STRING, "error")));
+
 	// Benchmark helpers
 	ClassDB::bind_method(D_METHOD("benchmark_noop"), &YggdrasilPeer::benchmark_noop);
 	ClassDB::bind_method(D_METHOD("benchmark_noop_data", "size"), &YggdrasilPeer::benchmark_noop_data);
+
+	// Raw C API access (bypass MultiplayerPeer protocol)
+	ClassDB::bind_method(D_METHOD("create_bare", "config_json"), &YggdrasilPeer::create_bare, DEFVAL("{}"));
+	ClassDB::bind_method(D_METHOD("send_raw", "dest_key_hex", "data"), &YggdrasilPeer::send_raw);
+	ClassDB::bind_method(D_METHOD("recv_raw", "timeout_ms"), &YggdrasilPeer::recv_raw);
+	ClassDB::bind_method(D_METHOD("send_raw_unreliable", "dest_key_hex", "data"), &YggdrasilPeer::send_raw_unreliable);
+	ClassDB::bind_method(D_METHOD("recv_raw_unreliable", "timeout_ms"), &YggdrasilPeer::recv_raw_unreliable);
 }
 
 // ---------------------------------------------------------------------------
@@ -157,10 +160,6 @@ String YggdrasilPeer::_inject_listen_scheme(const String &config_json) {
 
 	// Inject Listen via string manipulation to avoid Godot's JSON
 	// round-trip converting ints to floats (Go rejects 0.0 for uint16).
-	// Always prepend — if user also provides a top-level Listen array later
-	// in the JSON, Go's unmarshaler uses the last value so theirs wins.
-	// Note: can't check for "Listen" key — MulticastInterfaces has a
-	// "Listen": true boolean that gives a false positive.
 	String cfg = config_json.strip_edges();
 	String listen_val = "\"Listen\":[\"" + scheme + "://[::]:0\"]";
 	if (cfg.begins_with("{") && cfg.length() > 2) {
@@ -184,25 +183,29 @@ int YggdrasilPeer::_start_node(const String &config_json) {
 		return -1;
 	}
 
+	// Get IPv6 address (for display)
 	char *addr = ygg_get_address(handle);
 	if (addr) {
 		own_addr_str = addr;
-		parse_ipv6_addr(own_addr_str, own_addr_bytes);
 		ygg_free_string(addr);
 	}
 
-	UtilityFunctions::print(String("[YGG] Node started, address: ") + String(own_addr_str.c_str()));
-
-	char *ver = ygg_get_version();
-	if (ver) {
-		UtilityFunctions::print(String("[YGG] Yggdrasil version: ") + String(ver));
-		ygg_free_string(ver);
-	}
-
+	// Get public key (for routing)
 	char *pubkey = ygg_get_public_key(handle);
 	if (pubkey) {
-		UtilityFunctions::print(String("[YGG] Public key: ") + String(pubkey));
+		own_pubkey_hex = pubkey;
 		ygg_free_string(pubkey);
+	}
+
+	if (OS::get_singleton()->is_stdout_verbose()) {
+		UtilityFunctions::print(String("[YGG] Node started, address: ") + String(own_addr_str.c_str()));
+		UtilityFunctions::print(String("[YGG] Public key: ") + String(own_pubkey_hex.c_str()));
+
+		char *ver = ygg_get_version();
+		if (ver) {
+			UtilityFunctions::print(String("[YGG] Yggdrasil version: ") + String(ver));
+			ygg_free_string(ver);
+		}
 	}
 
 	return handle;
@@ -217,6 +220,9 @@ void YggdrasilPeer::_stop_node() {
 
 	if (recv_thread.joinable()) {
 		recv_thread.join();
+	}
+	if (dgram_recv_thread.joinable()) {
+		dgram_recv_thread.join();
 	}
 
 	ygg_handle = -1;
@@ -241,9 +247,10 @@ Error YggdrasilPeer::create_host(const String &config_json) {
 	unique_id.store(1);
 	connection_status_val.store(CONNECTION_CONNECTED);
 
-	// Start recv thread
+	// Start recv threads (reliable + unreliable datagram)
 	running.store(true);
 	recv_thread = std::thread(&YggdrasilPeer::_recv_loop, this);
+	dgram_recv_thread = std::thread(&YggdrasilPeer::_dgram_recv_loop, this);
 
 	_log_dbg("create_host() complete. peer_id=1, status=CONNECTED");
 	_log(String("Listening on: ") + String(own_addr_str.c_str()));
@@ -251,22 +258,46 @@ Error YggdrasilPeer::create_host(const String &config_json) {
 	return OK;
 }
 
-Error YggdrasilPeer::create_client(const String &server_address, const String &config_json) {
+Error YggdrasilPeer::create_client(const String &server_identity, const String &config_json) {
 	if (ygg_handle >= 0) {
 		_log_err("Already active, call close() first");
 		return ERR_ALREADY_IN_USE;
 	}
 
-	CharString addr_utf8 = server_address.utf8();
-	server_addr_str = addr_utf8.get_data();
-	if (!parse_ipv6_addr(server_addr_str, server_addr_bytes)) {
-		_log_err(String("Invalid server address: ") + server_address);
-		return ERR_INVALID_PARAMETER;
-	}
-
 	ygg_handle = _start_node(config_json);
 	if (ygg_handle < 0) {
 		return ERR_CANT_CREATE;
+	}
+
+	// Accept either a public key hex (64 chars) or an IPv6 address
+	CharString id_utf8 = server_identity.utf8();
+	std::string id_str = id_utf8.get_data();
+
+	if (id_str.find(':') != std::string::npos) {
+		// Looks like an IPv6 address — resolve to public key via routing table
+		_log_dbg(String("Resolving IPv6 address to public key: ") + server_identity);
+
+		// Give the overlay a moment to discover peers before resolving.
+		// The routing table needs to have seen the target node.
+		// We'll retry resolution during _poll if it fails here.
+		char *resolved = ygg_resolve_address(ygg_handle,
+				const_cast<char *>(id_str.c_str()));
+		if (resolved) {
+			server_pubkey_hex = resolved;
+			ygg_free_string(resolved);
+			_log_dbg(String("Resolved to key: ") + String(server_pubkey_hex.c_str()));
+		} else {
+			// Store the address for deferred resolution in _poll
+			_log_dbg("Address not yet in routing table, will retry resolution");
+			server_addr_pending = id_str;
+		}
+	} else if (id_str.length() == 64) {
+		server_pubkey_hex = id_str;
+	} else {
+		_log_err(String("Invalid server identity (expected 64-char hex key or IPv6 address): ") + server_identity);
+		_stop_node();
+		ygg_handle = -1;
+		return ERR_INVALID_PARAMETER;
 	}
 
 	server_mode = false;
@@ -275,22 +306,50 @@ Error YggdrasilPeer::create_client(const String &server_address, const String &c
 	connect_pending.store(true);
 	connect_retry_counter = 0;
 
-	// Map server address to peer_id 1
-	addr_to_peer[server_addr_str] = 1;
-	peer_to_addr[1] = server_addr_str;
+	// Map server key to peer_id 1 (if resolved)
+	if (!server_pubkey_hex.empty()) {
+		key_to_peer[server_pubkey_hex] = 1;
+		peer_to_key[1] = server_pubkey_hex;
+	}
 
-	// Start recv thread
+	// Start recv threads (reliable + unreliable datagram)
 	running.store(true);
 	recv_thread = std::thread(&YggdrasilPeer::_recv_loop, this);
+	dgram_recv_thread = std::thread(&YggdrasilPeer::_dgram_recv_loop, this);
 
-	_log_dbg(String("create_client() complete. status=CONNECTING, server=") + server_address);
-	_send_protocol_msg(server_addr_bytes, MSG_CONNECT_REQUEST);
+	_log_dbg(String("create_client() complete. status=CONNECTING, server=") + server_identity);
 
+	// Send connect request if key is already resolved
+	if (!server_pubkey_hex.empty()) {
+		_send_protocol_msg(server_pubkey_hex, MSG_CONNECT_REQUEST);
+	}
+
+	return OK;
+}
+
+Error YggdrasilPeer::create_relay(const String &config_json) {
+	if (ygg_handle >= 0) {
+		_log_err("Already active, call close() first");
+		return ERR_ALREADY_IN_USE;
+	}
+
+	ygg_handle = _start_node(config_json);
+	if (ygg_handle < 0) {
+		return ERR_CANT_CREATE;
+	}
+
+	// Relay nodes just participate in overlay routing — no recv thread,
+	// no application I/O, no ipv6rwc activation.
+	_log_dbg("create_relay() complete. Routing-only node.");
 	return OK;
 }
 
 String YggdrasilPeer::get_yggdrasil_address() const {
 	return String(own_addr_str.c_str());
+}
+
+String YggdrasilPeer::get_yggdrasil_public_key() const {
+	return String(own_pubkey_hex.c_str());
 }
 
 Error YggdrasilPeer::add_yggdrasil_peer(const String &uri) {
@@ -385,72 +444,85 @@ int YggdrasilPeer::get_yggdrasil_mtu() const {
 
 // ---------------------------------------------------------------------------
 // Recv thread - runs in background, queues incoming packets
+// Uses core I/O (ygg_recv_from) — no ipv6rwc, no IPv6/UDP headers.
 // ---------------------------------------------------------------------------
 
 void YggdrasilPeer::_recv_loop() {
 	const int BUF_SIZE = 65536;
 	uint8_t *buffer = new uint8_t[BUF_SIZE];
+	// Ed25519 public key = 32 bytes = 64 hex chars + null terminator
+	const int KEY_BUF_SIZE = 65;
+	char sender_key_buf[KEY_BUF_SIZE];
 
-	_log_dbg("recv_thread: started");
+	_log_dbg("recv_thread: started (core I/O mode)");
 
 	while (running.load()) {
-		int n = ygg_recv(ygg_handle, buffer, BUF_SIZE);
+		int n = ygg_recv_from(ygg_handle, buffer, BUF_SIZE,
+				sender_key_buf, KEY_BUF_SIZE);
 		if (n <= 0) {
 			if (running.load()) {
-				_log_err("recv_thread: ygg_recv returned <= 0, stopping");
+				_log_err("recv_thread: ygg_recv_from returned <= 0, stopping");
 			}
 			break;
 		}
-		_process_raw_packet(buffer, n);
+		std::string sender_key(sender_key_buf);
+		_process_packet(buffer, n, sender_key);
 	}
 
 	delete[] buffer;
 	_log_dbg("recv_thread: stopped");
 }
 
-void YggdrasilPeer::_process_raw_packet(const uint8_t *data, int len) {
-	// Minimum: 40 (IPv6) + 8 (UDP) + 1 (msg_type) = 49
-	if (len < 49) {
+// ---------------------------------------------------------------------------
+// Datagram recv thread - receives unreliable datagrams (QUIC RFC 9221)
+// Uses 100ms timeout so the thread checks running flag periodically.
+// ---------------------------------------------------------------------------
+
+void YggdrasilPeer::_dgram_recv_loop() {
+	const int BUF_SIZE = 65536;
+	uint8_t *buffer = new uint8_t[BUF_SIZE];
+	const int KEY_BUF_SIZE = 65;
+	char sender_key_buf[KEY_BUF_SIZE];
+
+	_log_dbg("dgram_recv_thread: started");
+
+	while (running.load()) {
+		int n = ygg_recv_from_unreliable(ygg_handle, buffer, BUF_SIZE,
+				sender_key_buf, KEY_BUF_SIZE, 100);
+		if (n == 0) {
+			continue; // Timeout, check running flag
+		}
+		if (n < 0) {
+			if (running.load()) {
+				_log_err("dgram_recv_thread: ygg_recv_from_unreliable returned < 0, stopping");
+			}
+			break;
+		}
+		std::string sender_key(sender_key_buf);
+		_process_packet(buffer, n, sender_key);
+	}
+
+	delete[] buffer;
+	_log_dbg("dgram_recv_thread: stopped");
+}
+
+void YggdrasilPeer::_process_packet(const uint8_t *data, int len,
+		const std::string &sender_key) {
+	// Minimum: 1 byte msg_type
+	if (len < 1) {
 		return;
 	}
 
-	// Verify IPv6 version
-	if ((data[0] >> 4) != 6) {
-		return;
-	}
-
-	// Extract source address (bytes 8-23)
-	const uint8_t *src_addr = data + 8;
-
-	// Check next header = 17 (UDP)
-	if (data[6] != 17) {
-		return;
-	}
-
-	// UDP header at byte 40
-	uint16_t dst_port = read_u16_be(data + 42);
-	if (dst_port != GAME_PORT) {
-		return;
-	}
-
-	// UDP payload starts at byte 48
-	const uint8_t *payload = data + 48;
-	int payload_len = len - 48;
-
-	if (payload_len < 1) {
-		return;
-	}
-
-	uint8_t msg_type = payload[0];
+	uint8_t msg_type = data[0];
 
 	switch (msg_type) {
 		case MSG_CONNECT_REQUEST:
-			_log_dbg(String("recv: CONNECT_REQUEST from ") + String(format_ipv6_addr(src_addr).c_str()));
-			_handle_connect_request(src_addr, payload + 1, payload_len - 1);
+			_log_dbg(String("recv: CONNECT_REQUEST from ") + String(sender_key.c_str()));
+			_handle_connect_request(sender_key, data + 1, len - 1);
 			break;
 		case MSG_CONNECT_ACCEPT:
 			_log_dbg("recv: CONNECT_ACCEPT from server");
-			_handle_connect_accept(payload + 1, payload_len - 1);
+			_handle_connect_accept(data + 1, len - 1);
 			break;
 		case MSG_CONNECT_REJECT:
 			_log_err("recv: CONNECT_REJECT from server");
@@ -458,11 +530,11 @@ void YggdrasilPeer::_process_raw_packet(const uint8_t *data, int len) {
 			connect_pending.store(false);
 			break;
 		case MSG_DISCONNECT:
-			_log_dbg(String("recv: DISCONNECT from ") + String(format_ipv6_addr(src_addr).c_str()));
-			_handle_disconnect(src_addr, payload + 1, payload_len - 1);
+			_log_dbg(String("recv: DISCONNECT from ") + String(sender_key.c_str()));
+			_handle_disconnect(sender_key, data + 1, len - 1);
 			break;
 		case MSG_DATA:
-			_handle_data(src_addr, payload + 1, payload_len - 1);
+			_handle_data(sender_key, data + 1, len - 1);
 			break;
 		default:
 			_log_dbg(String("recv: unknown msg_type=0x") + String::num_int64(msg_type, 16));
@@ -470,44 +542,43 @@ void YggdrasilPeer::_process_raw_packet(const uint8_t *data, int len) {
 	}
 }
 
-void YggdrasilPeer::_handle_connect_request(const uint8_t src_addr[16], const uint8_t *payload, int len) {
+void YggdrasilPeer::_handle_connect_request(const std::string &src_key,
+		const uint8_t *payload, int len) {
 	if (!server_mode) {
 		return;
 	}
 
 	if (refuse_connections) {
-		_send_protocol_msg(src_addr, MSG_CONNECT_REJECT);
+		_send_protocol_msg(src_key, MSG_CONNECT_REJECT);
 		return;
 	}
-
-	std::string addr_str = format_ipv6_addr(src_addr);
 
 	{
 		std::lock_guard<std::mutex> lock(queue_mutex);
 
 		// Check if already connected
-		auto it = addr_to_peer.find(addr_str);
-		if (it != addr_to_peer.end()) {
+		auto it = key_to_peer.find(src_key);
+		if (it != key_to_peer.end()) {
 			// Already known, resend accept
 			int peer_id = it->second;
 			uint8_t resp[4];
 			write_u32_be(resp, peer_id);
-			_send_protocol_msg(src_addr, MSG_CONNECT_ACCEPT, resp, 4);
+			_send_protocol_msg(src_key, MSG_CONNECT_ACCEPT, resp, 4);
 			return;
 		}
 
 		// Assign new peer ID
 		int peer_id = next_peer_id++;
-		addr_to_peer[addr_str] = peer_id;
-		peer_to_addr[peer_id] = addr_str;
+		key_to_peer[src_key] = peer_id;
+		peer_to_key[peer_id] = src_key;
 
 		// Send accept with assigned peer ID
 		uint8_t resp[4];
 		write_u32_be(resp, peer_id);
-		_send_protocol_msg(src_addr, MSG_CONNECT_ACCEPT, resp, 4);
+		_send_protocol_msg(src_key, MSG_CONNECT_ACCEPT, resp, 4);
 
 		_log_dbg(String("Accepted peer #") + String::num_int64(peer_id) +
-				String(" from ") + String(addr_str.c_str()));
+				String(" key=") + String(src_key.c_str()));
 
 		// Queue peer_connected event for emission in _poll (main thread)
 		{
@@ -535,20 +606,19 @@ void YggdrasilPeer::_handle_connect_accept(const uint8_t *payload, int len) {
 	_log_dbg(String("CONNECT_ACCEPT: assigned peer_id=") + String::num_int64(assigned_id));
 }
 
-void YggdrasilPeer::_handle_disconnect(const uint8_t src_addr[16], const uint8_t *payload, int len) {
-	std::string addr_str = format_ipv6_addr(src_addr);
-
+void YggdrasilPeer::_handle_disconnect(const std::string &src_key,
+		const uint8_t *payload, int len) {
 	{
 		std::lock_guard<std::mutex> lock(queue_mutex);
 
-		auto it = addr_to_peer.find(addr_str);
-		if (it == addr_to_peer.end()) {
+		auto it = key_to_peer.find(src_key);
+		if (it == key_to_peer.end()) {
 			return;
 		}
 
 		int peer_id = it->second;
-		addr_to_peer.erase(it);
-		peer_to_addr.erase(peer_id);
+		key_to_peer.erase(it);
+		peer_to_key.erase(peer_id);
 
 		_log_dbg(String("Peer #") + String::num_int64(peer_id) + String(" disconnected"));
 
@@ -565,7 +635,8 @@ void YggdrasilPeer::_handle_disconnect(const uint8_t src_addr[16], const uint8_t
 	}
 }
 
-void YggdrasilPeer::_handle_data(const uint8_t src_addr[16], const uint8_t *payload, int len) {
+void YggdrasilPeer::_handle_data(const std::string &src_key,
+		const uint8_t *payload, int len) {
 	// DATA payload: [4 bytes peer_id][1 byte transfer_mode][1 byte channel][data...]
 	if (len < 6) {
 		return;
@@ -593,53 +664,77 @@ void YggdrasilPeer::_handle_data(const uint8_t src_addr[16], const uint8_t *payl
 }
 
 // ---------------------------------------------------------------------------
-// Sending
+// Routing state
 // ---------------------------------------------------------------------------
 
-void YggdrasilPeer::_send_protocol_msg(const uint8_t dest_addr[16], MsgType type,
-		const uint8_t *payload, int payload_len) {
-	int udp_payload_len = 1 + payload_len;
-	std::vector<uint8_t> udp_payload(udp_payload_len);
-	udp_payload[0] = type;
-	if (payload && payload_len > 0) {
-		memcpy(&udp_payload[1], payload, payload_len);
+bool YggdrasilPeer::has_route(const String &peer_key_hex) const {
+	if (ygg_handle < 0) {
+		return false;
 	}
-	_send_ipv6_packet(dest_addr, udp_payload.data(), udp_payload_len);
+	CharString utf8 = peer_key_hex.utf8();
+	return ygg_has_route(ygg_handle, const_cast<char *>(utf8.get_data())) != 0;
 }
 
-void YggdrasilPeer::_send_ipv6_packet(const uint8_t dest_addr[16],
-		const uint8_t *udp_payload, int udp_payload_len) {
+int YggdrasilPeer::get_routing_entries() const {
+	if (ygg_handle < 0) {
+		return 0;
+	}
+	return ygg_get_routing_entries(ygg_handle);
+}
+
+int YggdrasilPeer::get_tree_entries() const {
+	if (ygg_handle < 0) {
+		return 0;
+	}
+	return ygg_get_tree_entries(ygg_handle);
+}
+
+// ---------------------------------------------------------------------------
+// Sending — uses core I/O (ygg_send_to with public key)
+// ---------------------------------------------------------------------------
+
+void YggdrasilPeer::_send_protocol_msg(const std::string &dest_key, MsgType type,
+		const uint8_t *payload, int payload_len) {
+	int total_len = 1 + payload_len;
+	std::vector<uint8_t> msg(total_len);
+	msg[0] = type;
+	if (payload && payload_len > 0) {
+		memcpy(&msg[1], payload, payload_len);
+	}
+	_send_to_key(dest_key, msg.data(), total_len);
+}
+
+void YggdrasilPeer::_send_to_key(const std::string &dest_key,
+		const uint8_t *data, int data_len) {
 	if (ygg_handle < 0) {
 		return;
 	}
 
-	// Total: 40 (IPv6 header) + 8 (UDP header) + udp_payload_len
-	int total_len = 40 + 8 + udp_payload_len;
-	std::vector<uint8_t> packet(total_len, 0);
-
-	// IPv6 header
-	packet[0] = 0x60; // Version 6
-	uint16_t ipv6_payload_len = 8 + udp_payload_len;
-	write_u16_be(&packet[4], ipv6_payload_len);
-	packet[6] = 17; // Next header: UDP
-	packet[7] = 64; // Hop limit
-	memcpy(&packet[8], own_addr_bytes, 16);  // Source address
-	memcpy(&packet[24], dest_addr, 16);      // Destination address
-
-	// UDP header
-	write_u16_be(&packet[40], GAME_PORT); // Source port
-	write_u16_be(&packet[42], GAME_PORT); // Dest port
-	write_u16_be(&packet[44], 8 + udp_payload_len); // UDP length
-	write_u16_be(&packet[46], 0); // Checksum (not validated by yggdrasil internal routing)
-
-	// UDP payload
-	memcpy(&packet[48], udp_payload, udp_payload_len);
-
-	int ret = ygg_send(ygg_handle, packet.data(), total_len);
+	int ret = ygg_send_to(ygg_handle,
+			const_cast<char *>(dest_key.c_str()),
+			const_cast<uint8_t *>(data), data_len);
 	if (ret < 0) {
 		const char *err = ygg_last_error();
-		_log_err(String("_send_ipv6_packet failed: ") +
-				(err ? String(err) : String("unknown")));
+		std::string err_str = err ? err : "unknown";
+		_log_err(String("_send_to_key failed: ") + String(err_str.c_str()));
+		std::lock_guard<std::mutex> lock(drop_mutex);
+		pending_drops.push_back({dest_key, err_str});
+	}
+}
+
+void YggdrasilPeer::_send_to_key_unreliable(const std::string &dest_key,
+		const uint8_t *data, int data_len) {
+	if (ygg_handle < 0) {
+		return;
+	}
+
+	int ret = ygg_send_to_unreliable(ygg_handle,
+			const_cast<char *>(dest_key.c_str()),
+			const_cast<uint8_t *>(data), data_len);
+	if (ret < 0) {
+		// Unreliable path unavailable — fall back to reliable.
+		// _send_to_key handles its own drop reporting.
+		_send_to_key(dest_key, data, data_len);
 	}
 }
 
@@ -679,44 +774,57 @@ Error YggdrasilPeer::_put_packet(const uint8_t *p_buffer, int32_t p_buffer_size)
 	payload[5] = (uint8_t)cur_transfer_channel;
 	memcpy(&payload[6], p_buffer, p_buffer_size);
 
-	// Wrap in protocol message
-	int udp_payload_len = 1 + payload_len;
-	std::vector<uint8_t> udp_payload(udp_payload_len);
-	udp_payload[0] = MSG_DATA;
-	memcpy(&udp_payload[1], payload.data(), payload_len);
+	// Wrap in protocol message: [MSG_DATA][payload]
+	int msg_len = 1 + payload_len;
+	std::vector<uint8_t> msg(msg_len);
+	msg[0] = MSG_DATA;
+	memcpy(&msg[1], payload.data(), payload_len);
 
-	auto send_to_addr = [&](const std::string &addr_str) {
-		uint8_t addr_bytes[16];
-		if (parse_ipv6_addr(addr_str, addr_bytes)) {
-			_send_ipv6_packet(addr_bytes, udp_payload.data(), udp_payload_len);
+	// Use unreliable datagram path for UNRELIABLE / UNRELIABLE_ORDERED modes.
+	// Falls back to reliable automatically if peer has no datagram support.
+	bool use_unreliable = (cur_transfer_mode == TRANSFER_MODE_UNRELIABLE ||
+			cur_transfer_mode == TRANSFER_MODE_UNRELIABLE_ORDERED);
+
+	// Helper: send to a specific key and report drop if no route exists
+	auto send_data_to = [&](const std::string &dest_key) {
+		bool route_exists = ygg_has_route(ygg_handle,
+				const_cast<char *>(dest_key.c_str())) != 0;
+		if (use_unreliable) {
+			_send_to_key_unreliable(dest_key, msg.data(), msg_len);
+		} else {
+			_send_to_key(dest_key, msg.data(), msg_len);
+		}
+		if (!route_exists) {
+			std::lock_guard<std::mutex> dlock(drop_mutex);
+			pending_drops.push_back({dest_key, "no route (packet silently dropped)"});
 		}
 	};
 
 	if (!server_mode) {
 		// Client always sends to server
-		send_to_addr(server_addr_str);
+		send_data_to(server_pubkey_hex);
 	} else {
 		// Server: route based on target_peer_id
 		std::lock_guard<std::mutex> lock(queue_mutex);
 
 		if (target_peer_id == 0) {
 			// Broadcast to all connected clients
-			for (const auto &pair : peer_to_addr) {
-				send_to_addr(pair.second);
+			for (const auto &pair : peer_to_key) {
+				send_data_to(pair.second);
 			}
 		} else if (target_peer_id < 0) {
 			// Send to all except |target_peer_id|
 			int exclude = -target_peer_id;
-			for (const auto &pair : peer_to_addr) {
+			for (const auto &pair : peer_to_key) {
 				if (pair.first != exclude) {
-					send_to_addr(pair.second);
+					send_data_to(pair.second);
 				}
 			}
 		} else {
 			// Send to specific peer
-			auto it = peer_to_addr.find(target_peer_id);
-			if (it != peer_to_addr.end()) {
-				send_to_addr(it->second);
+			auto it = peer_to_key.find(target_peer_id);
+			if (it != peer_to_key.end()) {
+				send_data_to(it->second);
 			}
 		}
 	}
@@ -739,7 +847,7 @@ int32_t YggdrasilPeer::_get_max_packet_size() const {
 	if (ygg_handle >= 0) {
 		int ygg_mtu = ygg_get_mtu(ygg_handle);
 		if (ygg_mtu > 0) {
-			mtu = ygg_mtu - 55; // 40 IPv6 + 8 UDP + 7 protocol header
+			mtu = ygg_mtu - 7; // 1 msg_type + 4 peer_id + 1 mode + 1 channel
 		}
 	}
 	return mtu > 0 ? mtu : 1200;
@@ -838,18 +946,52 @@ void YggdrasilPeer::_poll() {
 	}
 
 	// ---------------------------------------------------------------
-	// STEP 3: (removed) Packets are now read directly from incoming_queue
-	//   by _get_packet(). Client buffering is handled by
-	//   _get_available_packet_count() returning 0 until CONNECTED.
+	// STEP 2b: Emit packet_dropped signals (queued from send threads).
 	// ---------------------------------------------------------------
+	{
+		std::lock_guard<std::mutex> lock(drop_mutex);
+		for (const auto &drop : pending_drops) {
+			emit_signal("packet_dropped",
+					String(drop.peer_key.c_str()),
+					String(drop.error.c_str()));
+		}
+		pending_drops.clear();
+	}
 
 	// ---------------------------------------------------------------
-	// STEP 4: Client - retry connect request if still pending.
+	// STEP 3: Client - resolve pending address and retry connect.
+	//   Only send MSG_CONNECT_REQUEST when Ironwood has a route to
+	//   the server — otherwise the packet is silently dropped.
 	// ---------------------------------------------------------------
 	if (connect_pending.load() && !server_mode) {
+		// Deferred address resolution: if we were given an IPv6 address
+		// that wasn't in the routing table at create_client time, retry.
+		if (server_pubkey_hex.empty() && !server_addr_pending.empty()) {
+			char *resolved = ygg_resolve_address(ygg_handle,
+					const_cast<char *>(server_addr_pending.c_str()));
+			if (resolved) {
+				server_pubkey_hex = resolved;
+				ygg_free_string(resolved);
+				server_addr_pending.clear();
+				key_to_peer[server_pubkey_hex] = 1;
+				peer_to_key[1] = server_pubkey_hex;
+				_log_dbg(String("Resolved server address to key: ") +
+						String(server_pubkey_hex.c_str()));
+			}
+		}
+
 		connect_retry_counter++;
-		if (connect_retry_counter % 5 == 0) {
-			_send_protocol_msg(server_addr_bytes, MSG_CONNECT_REQUEST);
+		if (!server_pubkey_hex.empty() && connect_retry_counter % 5 == 0) {
+			bool route_ready = ygg_has_route(ygg_handle,
+					const_cast<char *>(server_pubkey_hex.c_str())) != 0;
+			// Always send — ygg_send_to triggers SendLookup for path discovery.
+			// Before route exists, the packet is silently dropped by Ironwood,
+			// but the SendLookup side-effect drives route convergence.
+			_send_protocol_msg(server_pubkey_hex, MSG_CONNECT_REQUEST);
+			if (!route_ready && connect_retry_counter % 300 == 0) {
+				_log_dbg(String("Waiting for route to server (routing_entries=") +
+						String::num_int64(ygg_get_routing_entries(ygg_handle)) + ")");
+			}
 		}
 	}
 }
@@ -864,14 +1006,11 @@ void YggdrasilPeer::_close() {
 	// Notify connected peers
 	if (server_mode) {
 		std::lock_guard<std::mutex> lock(queue_mutex);
-		for (const auto &pair : peer_to_addr) {
-			uint8_t addr_bytes[16];
-			if (parse_ipv6_addr(pair.second, addr_bytes)) {
-				_send_protocol_msg(addr_bytes, MSG_DISCONNECT);
-			}
+		for (const auto &pair : peer_to_key) {
+			_send_protocol_msg(pair.second, MSG_DISCONNECT);
 		}
 	} else if (connection_status_val.load() == CONNECTION_CONNECTED) {
-		_send_protocol_msg(server_addr_bytes, MSG_DISCONNECT);
+		_send_protocol_msg(server_pubkey_hex, MSG_DISCONNECT);
 	}
 
 	_stop_node();
@@ -884,8 +1023,9 @@ void YggdrasilPeer::_close() {
 	connect_accepted.store(false);
 	connect_accepted_id = 0;
 	connect_retry_counter = 0;
-	addr_to_peer.clear();
-	peer_to_addr.clear();
+	server_addr_pending.clear();
+	key_to_peer.clear();
+	peer_to_key.clear();
 	next_peer_id = 2;
 	incoming_queue.clear();
 	has_current_packet = false;
@@ -895,27 +1035,30 @@ void YggdrasilPeer::_close() {
 		pending_peer_connected.clear();
 		pending_peer_disconnected.clear();
 	}
+	{
+		std::lock_guard<std::mutex> lock(drop_mutex);
+		pending_drops.clear();
+	}
 
-	UtilityFunctions::print("[YGG] Connection closed, all state reset.");
+	if (OS::get_singleton()->is_stdout_verbose()) {
+		UtilityFunctions::print("[YGG] Connection closed, all state reset.");
+	}
 }
 
 void YggdrasilPeer::_disconnect_peer(int32_t p_peer, bool p_force) {
 	std::lock_guard<std::mutex> lock(queue_mutex);
 
-	auto it = peer_to_addr.find(p_peer);
-	if (it == peer_to_addr.end()) {
+	auto it = peer_to_key.find(p_peer);
+	if (it == peer_to_key.end()) {
 		return;
 	}
 
-	uint8_t addr_bytes[16];
-	if (parse_ipv6_addr(it->second, addr_bytes)) {
-		_send_protocol_msg(addr_bytes, MSG_DISCONNECT);
-	}
+	_send_protocol_msg(it->second, MSG_DISCONNECT);
 
 	_log_dbg(String("Disconnected peer #") + String::num_int64(p_peer));
 
-	addr_to_peer.erase(it->second);
-	peer_to_addr.erase(it);
+	key_to_peer.erase(it->second);
+	peer_to_key.erase(it);
 
 	{
 		std::lock_guard<std::mutex> elock(event_mutex);
@@ -967,6 +1110,96 @@ int YggdrasilPeer::benchmark_noop_data(int size) {
 		delete[] buf;
 	}
 	return size;
+}
+
+// ---------------------------------------------------------------------------
+// Raw C API access — bypass MultiplayerPeer protocol entirely.
+// For benchmarking: proves whether slowness is yggdrasil or SceneMultiplayer.
+// ---------------------------------------------------------------------------
+
+Error YggdrasilPeer::create_bare(const String &config_json) {
+	if (ygg_handle >= 0) {
+		_log_err("Already active, call close() first");
+		return ERR_ALREADY_IN_USE;
+	}
+
+	ygg_handle = _start_node(config_json);
+	if (ygg_handle < 0) {
+		return ERR_CANT_CREATE;
+	}
+
+	// No recv threads, no server mode, no protocol.
+	// Use send_raw()/recv_raw() for direct C API access.
+	_log_dbg("create_bare() complete. Raw C API mode — no recv threads.");
+	return OK;
+}
+
+int YggdrasilPeer::send_raw(const String &dest_key_hex, const PackedByteArray &data) {
+	if (ygg_handle < 0) {
+		return -1;
+	}
+	CharString key_utf8 = dest_key_hex.utf8();
+	return ygg_send_to(ygg_handle,
+			const_cast<char *>(key_utf8.get_data()),
+			const_cast<uint8_t *>(data.ptr()), data.size());
+}
+
+Dictionary YggdrasilPeer::recv_raw(int timeout_ms) {
+	Dictionary result;
+	if (ygg_handle < 0) {
+		return result;
+	}
+
+	uint8_t buf[65536];
+	char sender_key[65];
+
+	int n = ygg_recv_from_timeout(ygg_handle, buf, sizeof(buf),
+			sender_key, sizeof(sender_key), timeout_ms);
+	if (n <= 0) {
+		return result; // Empty dict = timeout or error
+	}
+
+	PackedByteArray pkt;
+	pkt.resize(n);
+	memcpy(pkt.ptrw(), buf, n);
+
+	result["data"] = pkt;
+	result["sender"] = String(sender_key);
+	return result;
+}
+
+int YggdrasilPeer::send_raw_unreliable(const String &dest_key_hex, const PackedByteArray &data) {
+	if (ygg_handle < 0) {
+		return -1;
+	}
+	CharString key_utf8 = dest_key_hex.utf8();
+	return ygg_send_to_unreliable(ygg_handle,
+			const_cast<char *>(key_utf8.get_data()),
+			const_cast<uint8_t *>(data.ptr()), data.size());
+}
+
+Dictionary YggdrasilPeer::recv_raw_unreliable(int timeout_ms) {
+	Dictionary result;
+	if (ygg_handle < 0) {
+		return result;
+	}
+
+	uint8_t buf[65536];
+	char sender_key[65];
+
+	int n = ygg_recv_from_unreliable(ygg_handle, buf, sizeof(buf),
+			sender_key, sizeof(sender_key), timeout_ms);
+	if (n <= 0) {
+		return result; // Empty dict = timeout or error
+	}
+
+	PackedByteArray pkt;
+	pkt.resize(n);
+	memcpy(pkt.ptrw(), buf, n);
+
+	result["data"] = pkt;
+	result["sender"] = String(sender_key);
+	return result;
 }
 
 bool YggdrasilPeer::_is_server_relay_supported() const {
