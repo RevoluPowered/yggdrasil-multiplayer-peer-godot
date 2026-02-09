@@ -20,9 +20,6 @@ class YggdrasilPeer : public MultiplayerPeerExtension {
 	GDCLASS(YggdrasilPeer, MultiplayerPeerExtension);
 
 public:
-	// Game protocol port embedded in IPv6/UDP framing
-	static constexpr uint16_t GAME_PORT = 9667;
-
 	// Protocol message types
 	enum MsgType : uint8_t {
 		MSG_CONNECT_REQUEST = 0x01,
@@ -63,9 +60,9 @@ private:
 	QueuedPacket current_packet;
 	bool has_current_packet = false;
 
-	// Peer tracking: maps yggdrasil IPv6 address <-> Godot peer ID
-	std::map<std::string, int> addr_to_peer;
-	std::map<int, std::string> peer_to_addr;
+	// Peer tracking: maps yggdrasil public key hex <-> Godot peer ID
+	std::map<std::string, int> key_to_peer;
+	std::map<int, std::string> peer_to_key;
 	int next_peer_id = 2; // 1 is reserved for server
 
 	// Peer connection/disconnection events (thread-safe, emitted in _poll)
@@ -73,16 +70,25 @@ private:
 	std::vector<int> pending_peer_disconnected;
 	std::mutex event_mutex;
 
-	// Own yggdrasil address (16 bytes binary)
-	uint8_t own_addr_bytes[16] = {};
-	std::string own_addr_str;
+	// Packet drop events (written by any thread, emitted in _poll on main thread)
+	struct DropEvent {
+		std::string peer_key;
+		std::string error;
+	};
+	std::vector<DropEvent> pending_drops;
+	std::mutex drop_mutex;
 
-	// Server address (for clients)
-	uint8_t server_addr_bytes[16] = {};
-	std::string server_addr_str;
+	// Own yggdrasil identity
+	std::string own_addr_str;      // IPv6 address (for display)
+	std::string own_pubkey_hex;    // Public key hex (64 chars, for routing)
 
-	// Recv thread
+	// Server identity (for clients)
+	std::string server_pubkey_hex;
+	std::string server_addr_pending; // IPv6 address awaiting resolution to pubkey
+
+	// Recv threads (reliable + unreliable datagram)
 	std::thread recv_thread;
+	std::thread dgram_recv_thread;
 	std::atomic<bool> running{false};
 
 	// Pending connection (client waiting for accept)
@@ -93,19 +99,19 @@ private:
 
 	// Internal helpers
 	void _recv_loop();
-	void _process_raw_packet(const uint8_t *data, int len);
-	void _handle_connect_request(const uint8_t src_addr[16], const uint8_t *payload, int len);
+	void _dgram_recv_loop();
+	void _process_packet(const uint8_t *data, int len, const std::string &sender_key);
+	void _handle_connect_request(const std::string &src_key, const uint8_t *payload, int len);
 	void _handle_connect_accept(const uint8_t *payload, int len);
-	void _handle_disconnect(const uint8_t src_addr[16], const uint8_t *payload, int len);
-	void _handle_data(const uint8_t src_addr[16], const uint8_t *payload, int len);
+	void _handle_disconnect(const std::string &src_key, const uint8_t *payload, int len);
+	void _handle_data(const std::string &src_key, const uint8_t *payload, int len);
 
-	void _send_protocol_msg(const uint8_t dest_addr[16], MsgType type,
+	void _send_protocol_msg(const std::string &dest_key, MsgType type,
 			const uint8_t *payload = nullptr, int payload_len = 0);
-	void _send_ipv6_packet(const uint8_t dest_addr[16],
-			const uint8_t *udp_payload, int udp_payload_len);
-
-	static bool parse_ipv6_addr(const std::string &str, uint8_t out[16]);
-	static std::string format_ipv6_addr(const uint8_t addr[16]);
+	void _send_to_key(const std::string &dest_key,
+			const uint8_t *data, int data_len);
+	void _send_to_key_unreliable(const std::string &dest_key,
+			const uint8_t *data, int data_len);
 
 	// Logging helpers - prefix with [SERVER] or [CLIENT #id]
 	String _log_prefix() const;
@@ -120,6 +126,10 @@ private:
 	int _start_node(const String &config_json);
 	void _stop_node();
 
+	// Helper: write/read big-endian uint32 (used in protocol messages)
+	static void write_u32_be(uint8_t *dst, uint32_t val);
+	static uint32_t read_u32_be(const uint8_t *src);
+
 protected:
 	static void _bind_methods();
 
@@ -129,8 +139,10 @@ public:
 
 	// Public API for GDScript
 	Error create_host(const String &config_json = "{}");
-	Error create_client(const String &server_address, const String &config_json = "{}");
+	Error create_client(const String &server_identity, const String &config_json = "{}");
+	Error create_relay(const String &config_json = "{}");
 	String get_yggdrasil_address() const;
+	String get_yggdrasil_public_key() const;
 	String start_listener(const String &uri);
 	Error add_yggdrasil_peer(const String &uri);
 	Error remove_yggdrasil_peer(const String &uri);
@@ -142,9 +154,23 @@ public:
 	void set_debug_logging(bool p_enable);
 	bool get_debug_logging() const;
 
+	// Routing state — exposed to GDScript
+	bool has_route(const String &peer_key_hex) const;
+	int get_routing_entries() const;
+	int get_tree_entries() const;
+
 	// Benchmark helpers — exposed to GDScript for latency measurement
 	void benchmark_noop();
 	int benchmark_noop_data(int size);
+
+	// Raw C API access — bypass MultiplayerPeer protocol entirely.
+	// create_bare() starts a ygg node without recv threads (for direct send_raw/recv_raw).
+	// BLOCKING: recv_raw/recv_raw_unreliable block the calling thread until data or timeout.
+	Error create_bare(const String &config_json = "{}");
+	int send_raw(const String &dest_key_hex, const PackedByteArray &data);
+	Dictionary recv_raw(int timeout_ms);
+	int send_raw_unreliable(const String &dest_key_hex, const PackedByteArray &data);
+	Dictionary recv_raw_unreliable(int timeout_ms);
 
 	// MultiplayerPeerExtension overrides
 	Error _get_packet(const uint8_t **r_buffer, int32_t *r_buffer_size) override;
