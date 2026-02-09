@@ -5,10 +5,10 @@ class_name YggdrasilDiscovery
 ## How it works:
 ## 1. Starts a temporary yggdrasil node with multicast enabled
 ## 2. Waits for LAN peers to appear in the yggdrasil peer list
-## 3. Returns discovered peer addresses
+## 3. Returns discovered peer public keys (used for create_client)
 ##
 ## Note: Discovery only finds yggdrasil peers on the network. The caller
-## should attempt to connect to each address to verify it is a game host.
+## should attempt to connect to each key to verify it is a game host.
 ## Connection verification requires the peer to be set as multiplayer_peer
 ## so that _poll() is called by the engine for connect retries.
 
@@ -16,8 +16,8 @@ const POLL_INTERVAL := 0.1
 const DEFAULT_TIMEOUT := 8.0
 const GRACE_AFTER_FIRST := 0.5
 
-## Discover peers on LAN and return their yggdrasil IPv6 addresses.
-## Starts a temporary node, waits for multicast discovery, then returns found addresses.
+## Discover peers on LAN and return their public key hex strings.
+## Starts a temporary node, waits for multicast discovery, then returns found keys.
 static func find_lan_peers(tree: SceneTree, config: String = '{"MulticastInterfaces":[{"Regex":".*","Beacon":true,"Listen":true,"Port":0}]}', timeout: float = DEFAULT_TIMEOUT) -> PackedStringArray:
 	var peer = YggdrasilPeer.new()
 	# Start as host just to bootstrap the yggdrasil node and enable multicast
@@ -26,8 +26,8 @@ static func find_lan_peers(tree: SceneTree, config: String = '{"MulticastInterfa
 		print("[YggDiscovery] Failed to start discovery node: %s" % error_string(err))
 		return PackedStringArray()
 
-	var own_address = peer.get_yggdrasil_address()
-	print("[YggDiscovery] Discovery node started at %s, scanning for LAN peers..." % own_address)
+	var own_key = peer.get_yggdrasil_public_key()
+	print("[YggDiscovery] Discovery node started (key=%s), scanning for LAN peers..." % own_key.substr(0, 16))
 
 	var found: PackedStringArray = []
 	var elapsed := 0.0
@@ -46,11 +46,12 @@ static func find_lan_peers(tree: SceneTree, config: String = '{"MulticastInterfa
 			continue
 
 		for p in parsed:
-			if p is Dictionary and p.has("IP"):
-				var addr: String = p["IP"]
-				if addr != "" and addr != own_address and addr not in found:
-					found.append(addr)
-					print("[YggDiscovery] Found peer: %s" % addr)
+			if p is Dictionary and p.has("KeyHex"):
+				var key_hex: String = p["KeyHex"]
+				if key_hex != "" and key_hex != own_key and key_hex not in found:
+					var ip: String = p.get("IP", "")
+					found.append(key_hex)
+					print("[YggDiscovery] Found peer: %s (ip=%s)" % [key_hex.substr(0, 16), ip])
 					if first_found_at < 0:
 						first_found_at = elapsed
 
@@ -62,7 +63,7 @@ static func find_lan_peers(tree: SceneTree, config: String = '{"MulticastInterfa
 	print("[YggDiscovery] Discovery complete. Found %d peer(s)." % found.size())
 	return found
 
-## Discover LAN peers and return the first one found.
+## Discover LAN peers and return the first one found (public key hex).
 ## The caller is responsible for actually connecting (via create_client + setting
 ## as multiplayer_peer) to verify it is a game host.
 static func find_host(tree: SceneTree, config: String = '{"MulticastInterfaces":[{"Regex":".*","Beacon":true,"Listen":true,"Port":0}]}', timeout: float = DEFAULT_TIMEOUT) -> String:
@@ -71,5 +72,5 @@ static func find_host(tree: SceneTree, config: String = '{"MulticastInterfaces":
 		print("[YggDiscovery] No peers found on LAN")
 		return ""
 
-	print("[YggDiscovery] Returning first discovered peer: %s" % peers[0])
+	print("[YggDiscovery] Returning first discovered peer: %s" % peers[0].substr(0, 16))
 	return peers[0]

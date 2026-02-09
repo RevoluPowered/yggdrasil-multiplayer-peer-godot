@@ -1,6 +1,6 @@
 [gd_scene format=3 uid="uid://cy6ppqb7dn0p5"]
 
-[ext_resource type="Script" uid="uid://dnjwhii1yaf0n" path="res://test/yggdrasil/yggdrasil-benchmark.test.gd" id="1"]
+[ext_resource type="Script" uid="uid://dve82oxfnejb6" path="res://test/yggdrasil/yggdrasil-benchmark.test.gd" id="1"]
 
 [node name="YggBenchmarkTest" type="Node" unique_id=238478693]
 script = ExtResource("1")

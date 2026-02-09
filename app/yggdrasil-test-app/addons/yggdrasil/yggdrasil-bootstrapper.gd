@@ -51,11 +51,12 @@ func host():
 	get_tree().get_multiplayer().server_relay = true
 
 	print("[YggBootstrap] Host started on yggdrasil address: ", _peer.get_yggdrasil_address())
+	print("[YggBootstrap] Public key: ", _peer.get_yggdrasil_public_key())
 
 	if connect_ui:
 		connect_ui.hide()
 	if status_label:
-		status_label.text = "Host: " + _peer.get_yggdrasil_address()
+		status_label.text = "Host: " + _peer.get_yggdrasil_public_key()
 
 	# Start NetworkTime if available
 	if has_node("/root/NetworkTime"):
@@ -63,12 +64,12 @@ func host():
 
 	return OK
 
-func join(server_address: String = ""):
-	if server_address == "" and address_input:
-		server_address = address_input.text.strip_edges()
+func join(server_identity: String = ""):
+	if server_identity == "" and address_input:
+		server_identity = address_input.text.strip_edges()
 
-	# Auto-discover host on LAN if no address or "localhost" entered
-	if server_address == "" or server_address == "localhost":
+	# Auto-discover host on LAN if no identity or "localhost" entered
+	if server_identity == "" or server_identity == "localhost":
 		print("[YggBootstrap] Auto-discovering host on LAN...")
 		if status_label:
 			status_label.text = "Discovering..."
@@ -79,30 +80,31 @@ func join(server_address: String = ""):
 				status_label.text = "No host found"
 			return ERR_CANT_RESOLVE
 
-		for addr in discovered:
-			print("[YggBootstrap] Trying discovered peer %s ..." % addr)
+		for key in discovered:
+			print("[YggBootstrap] Trying discovered peer %s ..." % key)
 			if status_label:
-				status_label.text = "Trying " + addr + "..."
-			var result = await _try_connect(addr)
+				status_label.text = "Trying " + key.substr(0, 8) + "..."
+			var result = await _try_connect(key)
 			if result == OK:
 				if address_input:
-					address_input.text = addr
+					address_input.text = key
 				return OK
-			print("[YggBootstrap] %s did not accept" % addr)
+			print("[YggBootstrap] %s did not accept" % key)
 
 		if status_label:
 			status_label.text = "No game host found"
 		return ERR_CANT_CONNECT
 
-	return await _try_connect(server_address)
+	return await _try_connect(server_identity)
 
-func _try_connect(server_address: String) -> Error:
+func _try_connect(server_identity: String) -> Error:
 	if _peer != null:
 		_peer.close()
 
 	_peer = YggdrasilPeer.new()
 
-	var err = _peer.create_client(server_address, yggdrasil_config)
+	# Accepts either public key hex (64 chars) or IPv6 address
+	var err = _peer.create_client(server_identity, yggdrasil_config)
 	if err != OK:
 		print("[YggBootstrap] Failed to connect: ", error_string(err))
 		if status_label:
@@ -115,7 +117,7 @@ func _try_connect(server_address: String) -> Error:
 	# Setting as multiplayer_peer ensures _poll() is called for connect retries
 	get_tree().get_multiplayer().multiplayer_peer = _peer
 
-	print("[YggBootstrap] Connecting to server at: ", server_address)
+	print("[YggBootstrap] Connecting to server: ", server_identity)
 	print("[YggBootstrap] Our yggdrasil address: ", _peer.get_yggdrasil_address())
 
 	if status_label:

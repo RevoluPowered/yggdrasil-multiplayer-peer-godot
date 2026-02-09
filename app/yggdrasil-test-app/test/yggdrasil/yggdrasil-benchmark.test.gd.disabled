@@ -85,8 +85,8 @@
 			#server_peer = YggdrasilPeer.new()
 			#expect_equal(server_peer.create_host(YGG_CONFIG), OK, "create_host")
 			## Start TCP listener for direct peering (bypasses multicast)
-			#_server_listen_uri = server_peer.start_listener("quic://127.0.0.1:0")
-			#print("  Server QUIC listener: %s" % _server_listen_uri)
+			#_server_listen_uri = server_peer.start_listener("tcp://127.0.0.1:0")
+			#print("  Server TCP listener: %s" % _server_listen_uri)
 			#server_mp = SceneMultiplayer.new()
 			#server_mp.server_relay = true
 			#server_mp.multiplayer_peer = server_peer
