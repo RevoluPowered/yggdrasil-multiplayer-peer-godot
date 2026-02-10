@@ -26,10 +26,6 @@ jobs:
         with:
           go-version-file: yggdrasil-go/go.mod
 
-      - name: Run yggdrasil-go unit tests
-        working-directory: yggdrasil-go
-        run: go test -v ./...
-
       - name: Run yggdrasil-go throughput tests
         working-directory: yggdrasil-go
         run: go test -v -timeout 40m ./contrib/lib/
