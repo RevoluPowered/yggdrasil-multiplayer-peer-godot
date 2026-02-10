@@ -29,7 +29,11 @@ jobs:
 
       - name: Run yggdrasil-go unit tests
         working-directory: yggdrasil-go
-        run: go test -v -timeout 10m -run "^Test(CoreWriteToReadFrom|TenClientsToOneServer)$" ./contrib/lib/
+        run: go test -v ./...
+
+      - name: Run yggdrasil-go throughput tests
+        working-directory: yggdrasil-go
+        run: go test -v -timeout 10m ./contrib/lib/
 
   build:
     name: Build (${{ matrix.name }} ${{ matrix.target }})
