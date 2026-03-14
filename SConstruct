@@ -23,6 +23,9 @@ env.Append(CPPPATH=["src/", "yggdrasil-go/"])
 ADDON_DIR = os.path.abspath("app/yggdrasil-test-app/addons/yggdrasil")
 ADDON_BIN = os.path.join(ADDON_DIR, "bin")
 
+NETFOX_ADDON_DIR = os.path.abspath("netfox/addons/netfox.yggdrasil")
+NETFOX_ADDON_BIN = os.path.join(NETFOX_ADDON_DIR, "bin")
+
 # --------------------------------------------------------------------------
 # Static library: build libyggdrasil.a from the yggdrasil-go submodule
 # --------------------------------------------------------------------------
@@ -251,6 +254,14 @@ if platform in ("macos", "ios"):
             shutil.copy2(gdext_src, gdext_dst)
             print("[deploy] gdextension -> {}".format(gdext_dst))
 
+        # Deploy to netfox addon
+        os.makedirs(NETFOX_ADDON_BIN, exist_ok=True)
+        netfox_dest = os.path.join(NETFOX_ADDON_BIN, "{}.framework".format(deploy_fw_name))
+        if os.path.exists(netfox_dest):
+            shutil.rmtree(netfox_dest)
+        shutil.copytree(fw_dir, netfox_dest)
+        print("[deploy] {} -> {}".format(fw_dir, netfox_dest))
+
     deploy = env.Command(
         framework_dir, library, create_framework_and_deploy,
     )
@@ -275,6 +286,12 @@ else:
         if os.path.exists(gdext_src):
             shutil.copy2(gdext_src, gdext_dst)
             print("[deploy] gdextension -> {}".format(gdext_dst))
+
+        # Deploy to netfox addon
+        os.makedirs(NETFOX_ADDON_BIN, exist_ok=True)
+        netfox_dest = os.path.join(NETFOX_ADDON_BIN, deploy_lib_name)
+        shutil.copy2(src, netfox_dest)
+        print("[deploy] {} -> {}".format(src, netfox_dest))
 
     deploy = env.Command(
         dest_lib, library, deploy_library,

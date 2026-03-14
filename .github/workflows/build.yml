@@ -1,7 +1,6 @@
 name: Build
 
 on:
-  push:
   pull_request:
   release:
     types: [published]
@@ -27,9 +26,9 @@ jobs:
         with:
           go-version-file: yggdrasil-go/go.mod
 
-      - name: Run yggdrasil-go unit tests
+      - name: Run yggdrasil-go throughput tests
         working-directory: yggdrasil-go
-        run: go test -v -timeout 10m -run "^Test(CoreWriteToReadFrom|TenClientsToOneServer)$" ./contrib/lib/
+        run: go test -v -timeout 40m ./contrib/lib/
 
   build:
     name: Build (${{ matrix.name }} ${{ matrix.target }})
